@@ -35,8 +35,6 @@ function print_current_revinfo
 #   os                   (<osname><osversion>)
 #   hintcksum            (md5sum, or / if no hintfile)
 {
-  [ "$OPT_TRACE" = 'y' ] && echo -e ">>>> ${FUNCNAME[*]}\n     $*" >&2
-
   local itemid="$1"
   local itemdir="${ITEMDIR[$itemid]}"
 
@@ -61,8 +59,8 @@ function print_current_revinfo
   osstuff="${SYS_OSNAME}${SYS_OSVER}"
 
   hintstuff='/'
-  if [ -n "${HINTFILE[$itemdir]}" ]; then
-    hintstuff="$(md5sum "${HINTFILE[$itemdir]}")"; hintstuff="${hintstuff/ */}"
+  if [ -n "${HINTFILE[$itemdir]}" ] && [ -s "${HINTFILE[$itemdir]}" ]; then
+     hintstuff="$(md5sum "${HINTFILE[$itemdir]}")"; hintstuff="${hintstuff/ */}"
   fi
 
   echo "$itemid" '/' "${deplist// /,}" "${verstuff} ${bltstuff} ${revstuff} ${osstuff} ${hintstuff}"
@@ -81,81 +79,82 @@ function print_current_revinfo
 
 #-------------------------------------------------------------------------------
 
-declare -a NEEDSBUILD
+declare -a TODOLIST
 declare -A STATUS STATUSINFO DIRECTDEPS FULLDEPS
 
 function calculate_deps_and_status
 # Works out dependencies and their build statuses.
-# Populates ${STATUS[$itemid]}, ${STATUSINFO[$itemid]}, ${NEEDSBUILD[@]},
+# Populates ${STATUS[$itemid]}, ${STATUSINFO[$itemid]}, ${TODOLIST[@]},
 #   ${DIRECTDEPS[$itemid]}, and ${FULLDEPS[$itemid]}.
 # Writes a pretty tree to $DEPTREE.
 # Arguments:
 #   $1 = itemid
 #   $2 = parent's itemid, or null if no parent
 #   $3 = indentation for pretty tree
-# Return status:
-#   0 = ok
-#   1 = any error, e.g. a previous build fail remembered somewhere in the dep tree
+# Return status: always 0.
+#   If anything really bad happened, TODOLIST will be empty ;-)
 {
-  [ "$OPT_TRACE" = 'y' ] && echo -e ">>>> ${FUNCNAME[*]}\n     $*" >&2
-
   local itemid="$1"
   local parentid="${2:-}"
   local indent="${3:-}"
   local itemprgnam="${ITEMPRGNAM[$itemid]}"
   local itemdir="${ITEMDIR[$itemid]}"
 
-  # Examine the current item
-  if [ -z "${STATUS[$itemid]}" ]; then
-    parse_info_and_hints "$itemid"
-    calculate_item_status "$itemid" "$parentid" || return 1
+  # These variables are used both here and in calculate_item_status.
+  # This isn't terribly efficient, but at least db_get_rev has a cache.
+  local pkgdeps pkgver pkgblt pkgrev pkgos pkghnt
+  read  pkgdeps pkgver pkgblt pkgrev pkgos pkghnt < <(db_get_rev "$itemid")
+  local pardeps parver parblt parrev paros parhnt
+  if [ -n "$parentid" ]; then
+    read pardeps parver parblt parrev paros parhnt < <(db_get_rev "$parentid" "$itemid")
   fi
 
-  # Verify all the dependencies in the info+hints, and make a list of them
-  local dep
-  local -a deplist=()
-  for dep in ${INFOREQUIRES[$itemid]}; do
-    if [ "$dep" = '%README%' ]; then
-      log_warning "${itemid}: Unhandled %README% in ${itemprgnam}.info"
-    elif [ "$dep" = "$itemprgnam" ]; then
-      log_warning "${itemid}: Ignoring dependency of ${itemprgnam} on itself"
-    else
-      find_slackbuild "$dep"
-      fstat=$?
-      if [ $fstat = 0 ]; then
-        deplist+=( "${R_SLACKBUILD}" )
-      elif [ $fstat = 1 ]; then
-        log_warning "${itemid}: Dependency $dep does not exist"
-      elif [ $fstat = 2 ]; then
-        log_warning "${itemid}: Dependency $dep matches more than one SlackBuild"
+  # Examine the current item
+  [ -z "${STATUS[$itemid]}" ] && parse_info_and_hints "$itemid"
+  calculate_item_status "$itemid" "$parentid"
+
+  if [ "${DIRECTDEPS[$itemid]-unset}" = 'unset' ]; then
+    # Verify all the dependencies in the info+hints, and make a list of them
+    local dep
+    local -a deplist=()
+    for dep in ${INFOREQUIRES[$itemid]}; do
+      if [ "$dep" = '%README%' ]; then
+        # %README% is now removed unconditionally, but we'll leave this check here for now:
+        log_warning "${itemid}: Unhandled %README% in ${itemprgnam}.info"
+      elif [ "$dep" = "$itemprgnam" ]; then
+        log_warning "${itemid}: Ignoring dependency of ${itemprgnam} on itself"
+      else
+        parse_arg "${dep}" "${itemid}"
+        [ "${#PARSEDARGS[@]}" != 0 ] && deplist+=( "${PARSEDARGS[@]}" )
       fi
-    fi
-  done
+    done
+    # Canonicalise the list of deps so we can detect changes in the future.
+    deplist=( $(printf '%s\n' ${deplist[*]} | sort -u) )
+    DIRECTDEPS[$itemid]="${deplist[*]}"
+  fi
 
-  # Canonicalise the list of deps so we can detect changes in the future.
-  deplist=( $(printf '%s\n' ${deplist[*]} | sort -u) )
-  DIRECTDEPS[$itemid]="${deplist[*]}"
-
-  # Walk the whole dependency tree for the item.
+  # Recursively walk the whole dependency tree for the item.
   if [ -z "${DIRECTDEPS[$itemid]}" ]; then
     # if there are no direct deps, then there are no recursive deps ;-)
     FULLDEPS[$itemid]=''
   else
+    local dep newdep olddep alreadygotnewdep
     local -a myfulldeps=()
-    for dep in "${deplist[@]}"; do
+    for dep in ${DIRECTDEPS[$itemid]}; do
       calculate_deps_and_status "$dep" "$itemid" "$indent  "
       for newdep in ${FULLDEPS[$dep]} "$dep"; do
-        gotnewdep='n'
+        alreadygotnewdep='n'
         for olddep in "${myfulldeps[@]}"; do
           if [ "$newdep" = "$olddep" ]; then
-            gotnewdep='y'
+            alreadygotnewdep='y'
             break
           elif [ "$newdep" = "$itemid" ]; then
-            log_error "${itemid}: Circular dependency via $dep"
-            return 1
+            alreadygotnewdep='y'
+            log_error "${itemid}: Circular dependency via $dep (ignored)"
+            break
           fi
         done
-        if [ "$gotnewdep" = 'n' ]; then
+        if [ "$alreadygotnewdep" = 'n' ]; then
           myfulldeps+=( "$newdep" )
         fi
       done
@@ -163,14 +162,53 @@ function calculate_deps_and_status
     FULLDEPS[$itemid]="${myfulldeps[*]}"
   fi
 
-  # Adjust the item's build status now that we know about its deps.
+  # Now that we know about the deps, adjust the item's status:
 
-  # Is this the top-level item and are we in rebuild mode => rebuild
-  # (code duplicated from calculate_item_status below)
-  if [ "${STATUS[$itemid]}" = "ok" ] && [ "$itemid" = "$ITEMID" ] && [ "$CMD" = 'rebuild' ]; then
+  # (1) has the list of deps changed => rebuild
+  [ "${pkgdeps}" = '/' ] && pkgdeps=""
+  if [ "${pkgdeps/ */}" != "${DIRECTDEPS[$itemid]// /,}" ]; then
+    if [ "${STATUS[$itemid]}" = 'ok' ]; then
+      STATUS[$itemid]="rebuild"
+      STATUSINFO[$itemid]="rebuild for added/removed deps"
+    elif [ "${STATUS[$itemid]}" = 'updated' ]; then
+      STATUS[$itemid]='updated+rebuild'
+      STATUSINFO[$itemid]="updated + rebuild for added/removed deps"
+    fi
+  fi
+
+  for dep in ${DIRECTDEPS[$itemid]}; do
+    case "${STATUS[$dep]}" in
+      # (2) is this dep ok, or merely being rebuilt => no need to adjust the item
+      'ok' | 'rebuild' )
+        :
+        ;;
+      # (3) have any of the deps been updated => rebuild the item
+      'add' | 'update' | 'updated' | 'updated+rebuild' )
+        if [ "${STATUS[$itemid]}" = 'ok' ]; then
+          STATUS[$itemid]="rebuild"
+          STATUSINFO[$itemid]="rebuild for updated deps"
+        elif [ "${STATUS[$itemid]}" = 'updated' ]; then
+          STATUS[$itemid]='updated+rebuild'
+          STATUSINFO[$itemid]="updated + rebuild for updated deps"
+        fi
+        ;;
+      # (4) are any of the deps skipped, unsupported, aborted, failed, whatever
+      #     => abort the item unless it is skipped/unsupported
+      'skipped' | 'unsupported' | 'remove' | 'removed' | 'aborted' | 'failed' | '*' )
+        if [ "${STATUS[$itemid]}" != "skipped" ] && [ "${STATUS[$itemid]}" != "unsupported" ] ; then
+          STATUS[$itemid]="aborted"
+          STATUSINFO[$itemid]="aborted"
+        fi
+        ;;
+    esac
+  done
+
+  if [ "$CMD" = 'rebuild' ] && [ "$itemid" = "$ITEMID" ] && [ "${STATUS[$itemid]}" = 'ok' ]; then
+    # (5) force a rebuild of the top level item if it hasn't previously been
+    # built in this session (as a dep of something else)
     found='n'
     for previously in "${OKLIST[@]}"; do
-      if [ "$previously" = "$ITEMID" ]; then found='y'; break; fi
+      if [ "$previously" = "$itemid" ]; then found='y'; break; fi
     done
     if [ "$found" = 'n' ]; then
       STATUS[$itemid]="rebuild"
@@ -178,72 +216,32 @@ function calculate_deps_and_status
     fi
   fi
 
-  # Has the list of deps changed => rebuild
-  pkgdeps=$(db_get_rev "$itemid")
-  [ "${pkgdeps/ */}" = '/' ] && pkgdeps=""
-  if [ "${STATUS[$itemid]}" = 'ok' ] && [ "${pkgdeps/ */}" != "${DIRECTDEPS[$itemid]// /,}" ]; then
-    STATUS[$itemid]="rebuild"
-    STATUSINFO[$itemid]="rebuild for added/removed deps"
-  fi
-
-  # Have any of the deps been updated => rebuild
-  # Are any of the deps skipped or unsupported => abort unless item is the same
-  # Are any of the deps aborted or failed => abort
-  for dep in ${DIRECTDEPS[$itemid]}; do
-    case "${STATUS[$dep]}" in
-      'add' | 'update' | 'updated' )
-        if [ "${STATUS[$itemid]}" = 'ok' ]; then
-          STATUS[$itemid]="rebuild"
-          STATUSINFO[$itemid]="rebuild for updated deps"
-        fi
-        ;;
-      'ok' | 'rebuild' )
-        :
-        ;;
-      'skipped' | 'unsupported' )
-        if [ "${STATUS[$itemid]}" != "${STATUS[$dep]}" ]; then
-          STATUS[$itemid]="aborted"
-          STATUSINFO[$itemid]=""
-        fi
-        ;;
-      'aborted' | 'failed' | '*' )
-        STATUS[$itemid]="aborted"
-        STATUSINFO[$itemid]=""
-        ;;
-    esac
-  done
+  # Add this item to the dependency tree and TODOLIST.
+  # Everything except 'ok' and 'updated' is added to TODOLIST for logging purposes.
 
   if [ "${STATUS[$itemid]}" = 'ok' ]; then
-    prettystatus=' [ok]'
-  elif [ "${STATUS[$itemid]}" = 'add' ] || [ "${STATUS[$itemid]}" = 'update' ] || [ "${STATUS[$itemid]}" = 'rebuild' ]; then
-    prettystatus=" [${tputgreen}${STATUS[$itemid]}${tputnormal}]"
+    prettystatus=" ${colour_ok}(ok)${colour_normal}"
+  elif [ "${STATUS[$itemid]}" = 'updated' ]; then
+    prettystatus=" ${colour_updated}(${STATUS[$itemid]})${colour_normal}"
+  else
+    if [ "${STATUS[$itemid]}" = 'add' ] || [ "${STATUS[$itemid]}" = 'update' ] || [ "${STATUS[$itemid]}" = 'rebuild' ] || [ "${STATUS[$itemid]}" = 'updated+rebuild' ]; then
+      prettystatus=" ${colour_build}(${STATUSINFO[$itemid]})${colour_normal}"
+    elif [ "${STATUS[$itemid]}" = 'remove' ] || [ "${STATUS[$itemid]}" = 'skipped' ] || [ "${STATUS[$itemid]}" = 'unsupported' ]; then
+      prettystatus=" ${colour_skip}(${STATUS[$itemid]})${colour_normal}"
+    else # removed, failed, aborted, and other not-yet-invented catastrophes
+      prettystatus=" ${colour_fail}(${STATUS[$itemid]})${colour_normal}"
+    fi
     additem='y'
-    for todo in "${NEEDSBUILD[@]}"; do
+    for todo in "${TODOLIST[@]}"; do
       [ "$todo" != "$itemid" ] && continue
       additem='n'
       break
     done
-    [ "$additem" = 'y' ] && NEEDSBUILD+=( "$itemid" )
-  elif [ "${STATUS[$itemid]}" = 'updated' ] || [ "${STATUS[$itemid]}" = 'skipped' ] || [ "${STATUS[$itemid]}" = 'unsupported' ]; then
-    prettystatus=" [${tputyellow}${STATUS[$itemid]}${tputnormal}]"
-  else # failed, aborted, and other not-yet-invented catastrophes
-    prettystatus=" [${tputred}${STATUS[$itemid]}${tputnormal}]"
-    # Add the item to NEEDSBUILD anyway, for logging purposes
-    additem='y'
-    for todo in "${NEEDSBUILD[@]}"; do
-      [ "$todo" != "$itemid" ] && continue
-      additem='n'
-      break
-    done
-    [ "$additem" = 'y' ] && NEEDSBUILD+=( "$itemid" )
+    [ "$additem" = 'y' ] && TODOLIST+=( "$itemid" )
   fi
   DEPTREE="${indent}${itemid}${prettystatus}"$'\n'"$DEPTREE"
 
-  if [ "${STATUS[$itemid]}" = 'aborted' ] || [ "${STATUS[$itemid]}" = 'failed' ] || [ "${STATUS[$itemid]}" = 'skipped' ] || [ "${STATUS[$itemid]}" = 'unsupported' ]; then
-    return 1
-  else
-    return 0
-  fi
+  return 0
 }
 
 #-------------------------------------------------------------------------------
@@ -252,65 +250,66 @@ function calculate_item_status
 # Works out whether the package needs to be built etc
 # $1 = itemid
 # $2 = parentid (or null)
-# Return status:
-# 0 = success, STATUS[$itemid] (and optionally STATUSINFO[$itemid]) have been set
-# 1 = any failure
-# Also sets these variables when status=0:
-# BUILDEXTRA = friendly changelog-style message describing the build
+# Return status: always 0, sets STATUS[$itemid] and STATUSINFO[$itemid]
 {
-  [ "$OPT_TRACE" = 'y' ] && echo -e ">>>> ${FUNCNAME[*]}\n     $*" >&2
-
   local itemid="$1"
-  local itemprgnam=${ITEMPRGNAM[$itemid]}
-  local itemdir=${ITEMDIR[$itemid]}
+  local itemprgnam="${ITEMPRGNAM[$itemid]}"
+  local itemdir="${ITEMDIR[$itemid]}"
+  local parentid="$2"
   local -a pkglist modifilelist
 
   # Quick checks if we've already seen this item:
   if [ "${STATUS[$itemid]}" = "ok" ] || [ "${STATUS[$itemid]}" = "updated" ]; then
     if [ -n "$parentid" ]; then
       # check revisions - $itemid may be more recent than $parentid
-      read pkgdeps pkgver pkgblt pkgrev pkgos pkghnt < <(db_get_rev "$itemid")
-      read pardeps parver parblt parrev paros parhnt < <(db_get_rev "$parentid" "$itemid")
       # proceed only if the parent exists in the database
-      if [ "$parver" != '' ]; then
+      if [ -n "$parver" ]; then
         # ignore built field (merely rebuilt deps don't matter)
         # and ignore hintfile field (significant changes will show up as version or deplist changes)
         if [ "$pardeps $parver $parrev $paros" != "$pkgdeps $pkgver $pkgrev $pkgos" ]; then
           STATUS[$itemid]="updated"
-          STATUSINFO[$itemid]=""
+          STATUSINFO[$itemid]="updated"
           return 0
         fi
       fi
     fi
     STATUS[$itemid]="ok"
-    STATUSINFO[$itemid]=""
+    STATUSINFO[$itemid]="ok"
     return 0
-  elif [ "${STATUS[$itemid]}" = "aborted" ] || [ "${STATUS[$itemid]}" = "failed" ] || [ "${STATUS[$itemid]}" = "skipped" ] || [ "${STATUS[$itemid]}" = "unsupported" ]; then
+  elif [ "${STATUS[$itemid]}" = "aborted" ] || [ "${STATUS[$itemid]}" = "failed" ]  || \
+       [ "${STATUS[$itemid]}" = "removed" ] || [ "${STATUS[$itemid]}" = "skipped" ] || \
+       [ "${STATUS[$itemid]}" = "unsupported" ]; then
     # the situation is not going to improve ;-)
     return 0
   fi
 
+  # No SlackBuild => remove
+  if [ -z "$itemdir" ] || [ ! -d "$SR_SBREPO"/"$itemdir" ]; then
+    STATUS[$itemid]="remove"
+    STATUSINFO[$itemid]=""
+    return 0
+  fi
+
   # Package dir not in either repo => add
-  if [ ! -d "$DRYREPO"/"$itemdir" ] && [ ! -d "$SR_PKGREPO"/"$itemdir" ]; then
-    STATUS[$itemid]="add"
-    STATUSINFO[$itemid]="add version ${HINT_VERSION[$itemid]:-${INFOVERSION[$itemid]}}"
+  if [ ! -d "$SR_PKGREPO"/"$itemdir" ]; then
+    if [ -z "$DRYREPO" ] || [ ! -d "$DRYREPO"/"$itemdir" ]; then
+      STATUS[$itemid]="add"
+      STATUSINFO[$itemid]="add version ${HINT_VERSION[$itemid]:-${INFOVERSION[$itemid]}}"
+    fi
     return 0
   fi
 
   # Package dir has no packages => add
-  pkglist=( "$SR_PKGREPO"/"$itemdir"/*.t?z )
+  pkglist=( "$SR_PKGREPO"/"$itemdir"/*.t?z )   ####
   if [ ! -f "${pkglist[0]}" ]; then
     # Nothing in the main repo, so look in dryrun repo
-    pkglist=( "$DRYREPO"/"$itemdir"/*.t?z )
+    pkglist=( "$DRYREPO"/"$itemdir"/*.t?z )    ####
     if [ ! -f "${pkglist[0]}" ]; then
       STATUS[$itemid]="add"
       STATUSINFO[$itemid]="add version ${HINT_VERSION[$itemid]:-${INFOVERSION[$itemid]}}"
       return 0
     fi
   fi
-
-  # Get info about the existing build from the database
-  read pkgdeps pkgver pkgblt pkgrev pkgos pkghnt < <(db_get_rev "$itemid")
 
   # Are we upversioning => update
   currver="${HINT_VERSION[$itemid]:-${INFOVERSION[$itemid]}}"
@@ -323,7 +322,7 @@ function calculate_item_status
   if [ "$GOTGIT" = 'n' ]; then
 
     # If this isn't a git repo, and any of the files have been modified since the package was built => update
-    modifilelist=( $(find -L "$SR_SBREPO"/"$itemdir" -newermt @"$pkgblt" 2>/dev/null) )
+    readarray -t modifilelist < <(find -L "$SR_SBREPO"/"$itemdir" -newermt @"$pkgblt" 2>/dev/null)
     if [ ${#modifilelist[@]} != 0 ]; then
       STATUS[$itemid]="update"
       STATUSINFO[$itemid]="update for modified files"
@@ -341,18 +340,28 @@ function calculate_item_status
     # If the git rev has changed => update
     if [ "$pkgrev" != "$currrev" ]; then
       if [ "${GITDIRTY[$itemid]}" != 'y' -a "${pkgrev/*+/+}" != '+dirty' ]; then
-        #   if only README, slack-desc and .info have changed, don't build
-        #   (the VERSION in the .info file has already been checked ;-)
-        modifilelist=( $(cd "$SR_SBREPO"; git diff --name-only "$pkgrev" "$currrev" -- "$itemdir") )
-        for modifile in "${modifilelist[@]}"; do
-          bn="${modifile##*/}"
-          [ "$bn" = "README" ] && continue
-          [ "$bn" = "slack-desc" ] && continue
-          [ "$bn" = "$itemprgnam.info" ] && continue
+        # if only README, slack-desc and .info have changed, don't build
+        # (the VERSION in the .info file has already been checked ;-)
+        modifilelist=( $(cd "$SR_SBREPO"; git diff --name-only "$pkgrev" "$currrev" -- "$itemdir" 2>/dev/null) )
+        if [ $? = 0 ]; then
+          for modifile in "${modifilelist[@]}"; do
+            bn="${modifile##*/}"
+            [ "$bn" = "README" ] && continue
+            [ "$bn" = "slack-desc" ] && continue
+            [ "$bn" = "$itemprgnam.info" ] && continue
+            STATUS[$itemid]="update"
+            STATUSINFO[$itemid]="update for git $shortcurrrev"
+            # get title of the latest commit message
+            title="$(cd "$SR_SBREPO"/"$itemdir"; git log --pretty=format:%s -n 1 . | sed -e "s/.*${itemprgnam}: //" -e 's/\.$//')"
+            [ -n "$title" ] && STATUSINFO[$itemid]="${STATUSINFO[$itemid]} \"$title\""
+            return 0
+          done
+        else
+          # nonzero status means $pkgrev is no longer valid (e.g. upstream has rewritten history) => update
           STATUS[$itemid]="update"
           STATUSINFO[$itemid]="update for git $shortcurrrev"
           return 0
-        done
+        fi
       else
         # we can't do the above check if git is or was dirty
         STATUS[$itemid]="update"
@@ -363,7 +372,7 @@ function calculate_item_status
 
     # If git is dirty, and any file has been modified since the package was built => update
     if [ "${GITDIRTY[$itemid]}" = 'y' ]; then
-      modifilelist=( $(find -L "$SR_SBREPO"/"$itemdir" -newermt @"$pkgblt" 2>/dev/null) )
+      readarray -t modifilelist < <(find -L "$SR_SBREPO"/"$itemdir" -newermt @"$pkgblt" 2>/dev/null)
       if [ ${#modifilelist[@]} != 0 ]; then
         STATUS[$itemid]="update"
         STATUSINFO[$itemid]="update for git $shortcurrrev"
@@ -374,56 +383,51 @@ function calculate_item_status
   fi
 
   # check revisions - $itemid may be more recent than $parentid
-  if [ -n "$parentid" ]; then
-    read pardeps parver parblt parrev paros parhnt < <(db_get_rev "$parentid" "$itemid")
-    # proceed only if the parent exists in the database
-    if [ "$parver" != '' ]; then
-      # ignore built field (merely rebuilt deps don't matter)
-      # and ignore hintfile field (significant changes will show up as version or deplist changes)
-      if [ "$pardeps $parver $parrev $paros" != "$pkgdeps $pkgver $pkgrev $pkgos" ]; then
-        STATUS[$itemid]="updated"
-        STATUSINFO[$itemid]=""
-        return 0
-      fi
-    fi
-  fi
-
-  # Is this the top-level item and are we in rebuild mode
-  #   => rebuild if it hasn't previously been built in this session (as a dep of something else)
-  if [ "$itemid" = "$ITEMID" -a "$CMD" = 'rebuild' ]; then
-    found='n'
-    for previously in "${OKLIST[@]}"; do
-      if [ "$previously" = "$ITEMID" ]; then found='y'; break; fi
-    done
-    if [ "$found" = 'n' ]; then
-      STATUS[$itemid]="rebuild"
-      STATUSINFO[$itemid]="rebuild"
-      return 0
+  # (proceed only if $parentid has an entry in the database)
+  if [ "$parver" != '' ]; then
+    # ignore built field (merely rebuilt deps don't matter)
+    # and ignore hintfile field (significant changes will show up as version or deplist changes)
+    if [ "$pardeps $parver $parrev $paros" != "$pkgdeps $pkgver $pkgrev $pkgos" ]; then
+      STATUS[$itemid]="updated"
+      STATUSINFO[$itemid]="updated"
+      # don't return -- it may need a rebuild (see below)
     fi
   fi
 
   # Has the OS changed => rebuild
   curros="${SYS_OSNAME}${SYS_OSVER}"
   if [ "$pkgos" != "$curros" ]; then
-    STATUS[$itemid]="rebuild"
-    STATUSINFO[$itemid]="rebuild for upgraded ${SYS_OSNAME}"
+    if [ "${STATUS[$itemid]}" = 'updated' ]; then
+      STATUS[$itemid]="updated+rebuild"
+      STATUSINFO[$itemid]="updated + rebuild for upgraded ${SYS_OSNAME}"
+    else
+      STATUS[$itemid]="rebuild"
+      STATUSINFO[$itemid]="rebuild for upgraded ${SYS_OSNAME}"
+    fi
     return 0
   fi
 
   # Has the hintfile changed => rebuild
   currhnt='/'
-  if [ -n "${HINTFILE[$itemdir]}" ]; then
+  if [ -n "${HINTFILE[$itemdir]}" ] && [ -s "${HINTFILE[$itemdir]}" ]; then
     currhnt="$(md5sum "${HINTFILE[$itemdir]}")"; currhnt="${currhnt/ */}"
   fi
   if [ "$pkghnt" != "$currhnt" ]; then
-    STATUS[$itemid]="rebuild"
-    STATUSINFO[$itemid]="rebuild for hintfile changes"
+    if [ "${STATUS[$itemid]}" = 'updated' ]; then
+      STATUS[$itemid]="updated+rebuild"
+      STATUSINFO[$itemid]="updated + rebuild for hintfile changes"
+    else
+      STATUS[$itemid]="rebuild"
+      STATUSINFO[$itemid]="rebuild for hintfile changes"
+    fi
     return 0
   fi
 
-  # It seems to be up to date!
-  STATUS[$itemid]="ok"
-  STATUSINFO[$itemid]=""
+  # It seems to be up to date! although it may have been updated (see above)
+  if [ "${STATUS[$itemid]}" != 'updated' ]; then
+    STATUS[$itemid]="ok"
+    STATUSINFO[$itemid]="ok"
+  fi
   return 0
 
 }
@@ -436,8 +440,6 @@ function write_pkg_metadata
 # Return status:
 # 9 = bizarre existential error, otherwise 0
 {
-  [ "$OPT_TRACE" = 'y' ] && echo -e ">>>> ${FUNCNAME[*]}\n     $*" >&2
-
   local itemid="$1"
   local itemprgnam="${ITEMPRGNAM[$itemid]}"
   local itemdir="${ITEMDIR[$itemid]}"
@@ -468,21 +470,14 @@ function write_pkg_metadata
   [ "$OPT_DRY_RUN" = 'y' ] && myrepo="$DRYREPO"
   pkglist=( "$myrepo"/"$itemdir"/*.t?z )
 
-  operation="$(echo "${STATUSINFO[$itemid]}" | sed -e 's/^add/Added/' -e 's/^update/Updated/' -e 's/^rebuild/Rebuilt/' )"
+  operation="$(echo "${STATUSINFO[$itemid]}" | sed -e 's/^add/Added/' -e 's/^updated + //' -e 's/^update /Updated /' -e 's/^rebuild/Rebuilt/' )"
   extrastuff=''
-  case "${STATUSINFO[$itemid]}" in
-  add*)
-      # append short description from slack-desc (if there's no slack-desc, this should be null)
-      extrastuff="($(grep "^${pkgnam}: " "$SR_SBREPO"/"$itemdir"/slack-desc 2>/dev/null| head -n 1 | sed -e 's/.*(//' -e 's/).*//'))"
-      ;;
-  'update for git'*)
-      # append title of the latest commit message
-      extrastuff="($(cd "$SR_SBREPO"/"$itemdir"; git log --pretty=format:%s -n 1 . | sed -e 's/.*: //' -e 's/\.$//'))"
-      ;;
-  *)  :
-      ;;
-  esac
-  [ "$extrastuff" = '()' ] && extrastuff=''
+  if [ "${STATUSINFO[$itemid]:0:3}" = 'add' ]; then
+    # append short description from slack-desc (if there's no slack-desc, this should be null)
+    extrastuff="($(grep "^${pkgnam}: " "$SR_SBREPO"/"$itemdir"/slack-desc 2>/dev/null| head -n 1 | sed -e 's/.*(//' -e 's/).*//'))"
+    [ "$extrastuff" = '()' ] && extrastuff=''
+  fi
+
   # build_ok will need this:
   CHANGEMSG="$operation"
   [ -n "$extrastuff" ] && CHANGEMSG="${CHANGEMSG} ${extrastuff}"
@@ -575,7 +570,7 @@ EOF
       pkgsize=$(du -s "$pkgpath" | cut -f1)
       # this uncompressed size is approx, but hopefully good enough ;-)
       uncsize=$(awk '{t+=int($3/1024)+1} END {print t}' "$TMP_PKGCONTENTS")
-      echo "PACKAGE NAME:  $pkgbase" > "$dotmeta"
+      echo "PACKAGE NAME:  $pkgbasename" > "$dotmeta"
       if [ -n "$SR_DL_URL" ]; then
         echo "PACKAGE MIRROR:  $SR_DL_URL" >> "$dotmeta"
       fi

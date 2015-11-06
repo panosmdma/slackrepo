@@ -6,11 +6,15 @@
 #   verify_src
 #   download_src
 #   print_curl_status
+#   print_wget_status
 #-------------------------------------------------------------------------------
 
 function verify_src
 # Verify item's source files in the source cache
 # $1 = itemid
+# $2 = (optional) logging level (default="log_important")
+#      This allows us to log errors after retrying the download
+#      and to log warnings when we're doing a lint :D
 # Return status:
 # 0 - all files passed, or md5/sha256sum check suppressed, or DOWNLIST is empty
 # 1 - one or more files had a bad md5sum or sha256sum
@@ -20,9 +24,8 @@ function verify_src
 # 5 - .info says item is unsupported/untested on this arch
 # 6 - not in source cache and there is a nodownload hint
 {
-  [ "$OPT_TRACE" = 'y' ] && echo -e ">>>> ${FUNCNAME[*]}\n     $*" >&2
-
   local itemid="$1"
+  local loglevel="${2:-log_important}"
   local -a srcfilelist
 
   VERSION="${INFOVERSION[$itemid]}"
@@ -41,59 +44,66 @@ function verify_src
   [ ! -d "$DOWNDIR" ] && return 3
 
   # More complex checks:
-  ( cd "$DOWNDIR"
 
-    # if wrong version, return 6 (nodownload hint) or 4 (version mismatch)
-    if [ -f .version ]; then
-      if [ "$VERSION" != "$(cat .version)" ]; then
-        log_verbose -a "Removing old source files"
-        find . -maxdepth 1 -type f -exec rm -f {} \;
-        [ -n "${HINT_NODOWNLOAD[$itemid]}" ] && return 6
-        return 4
+  # if wrong version, return 6 (nodownload hint) or 4 (version mismatch)
+  if [ -f "$DOWNDIR"/.version ]; then
+    if [ "$VERSION" != "$(cat "$DOWNDIR"/.version)" ]; then
+      if [ "$CMD" != 'lint' ]; then
+        log_normal -a "Removing old source files ... "
+        find "$DOWNDIR" -maxdepth 1 -type f -exec rm -f {} \;
+        log_done
       fi
-    fi
-
-    # check files in this dir only (arch-specific subdirectories may exist, ignore them)
-    IFS=$'\n'; srcfilelist=( $(find . -maxdepth 1 -type f \! -name .version -print 2>/dev/null | sed 's#^\./##') ); unset IFS
-    numgot=${#srcfilelist[@]}
-    # no files, empty directory => return 3 (same as no directory) or 6
-    [ $numgot = 0 -a -n "${HINT_NODOWNLOAD[$itemid]}" ] && return 6
-    [ $numgot = 0 ] && return 3
-    # or if we have not got the right number of sources, return 2 (or 6)
-    numwant=$(echo "$DOWNLIST" | wc -w)
-    if [ "$numgot" != "$numwant" ]; then
-      log_verbose -a "Note: need $numwant source files, but have $numgot"
       [ -n "${HINT_NODOWNLOAD[$itemid]}" ] && return 6
-      return 2
+      return 4
     fi
+  fi
 
-    # if we're ignoring the md5sums and sha256sums, we've finished! => return 0
-    [ "${HINT_MD5IGNORE[$itemid]}" = 'y' -a "${HINT_SHA256IGNORE[$itemid]}" = 'y' ] && return 0
+  # check files in this dir only (arch-specific subdirectories may exist, ignore them)
+  readarray -t srcfilelist < <(find "$DOWNDIR" -maxdepth 1 -type f \! -name .version -print 2>/dev/null)
+  numgot=${#srcfilelist[@]}
+  # no files, empty directory => return 3 (same as no directory) or 6
+  [ $numgot = 0 -a -n "${HINT_NODOWNLOAD[$itemid]}" ] && return 6
+  [ $numgot = 0 ] && return 3
+  # or if we have not got the right number of sources, return 2 (or 6)
+  numwant=$(echo "$DOWNLIST" | wc -w)
+  if [ "$numgot" != "$numwant" ]; then
+    ${loglevel} -a "${itemid}: Found ${numgot} source file(s), but ${numwant} required"
+    [ -n "${HINT_NODOWNLOAD[$itemid]}" ] && return 6
+    return 2
+  fi
 
-    # run the md5 and/or sha256 check on all the files (don't give up at the first error)
-    log_normal -a "Verifying source files ..."
-    allok='y'
-    if [ "${HINT_MD5IGNORE[$itemid]}" != 'y' -a -n "$MD5LIST" ]; then
-      for f in "${srcfilelist[@]}"; do
-        mf=$(md5sum "$f"); mf="${mf/ */}"
-        ok='n'
-        # The next bit checks all files have a good md5sum, but not vice versa, so it's not perfect :-/
-        for minfo in $MD5LIST; do if [ "$mf" = "$minfo" ]; then ok='y'; break; fi; done
-        [ "$ok" = 'y' ] || { log_important -a "Failed md5sum: $f"; log_verbose -a "  actual md5sum is $mf"; allok='n'; }
-      done
-    fi
-    if [ "${HINT_SHA256IGNORE[$itemid]}" != 'y' -a -n "$SHA256LIST" ]; then
-      for f in "${srcfilelist[@]}"; do
-        sf=$(sha256sum "$f"); sf="${sf/ */}"
-        ok='n'
-        # The next bit checks all files have a good sha256sum, but not vice versa, so it's not perfect :-/
-        for sinfo in $SHA256LIST; do if [ "$sf" = "$sinfo" ]; then ok='y'; break; fi; done
-        [ "$ok" = 'y' ] || { log_important -a "Failed sha256sum: $f"; log_verbose -a "  actual sha256sum is $sf"; allok='n'; }
-      done
-    fi
-    [ "$allok" = 'y' ] || { if [ -n "${HINT_NODOWNLOAD[$itemid]}" ]; then return 6; else return 1; fi; }
-  )
-  return $?  # status comes directly from subshell
+  # if we're ignoring the md5sums and sha256sums, we've finished! => return 0
+  [ "${HINT_MD5IGNORE[$itemid]}" = 'y' -a "${HINT_SHA256IGNORE[$itemid]}" = 'y' ] && return 0
+
+  # run the md5 and/or sha256 check on all the files (don't give up at the first error)
+  log_normal -a "Verifying source files ... "
+  allok='y'
+  if [ "${HINT_MD5IGNORE[$itemid]}" != 'y' -a -n "$MD5LIST" ]; then
+    for f in "${srcfilelist[@]}"; do
+      mf=$(md5sum "$f"); mf="${mf/ */}"
+      ok='n'
+      # The next bit checks all files have a good md5sum, but not vice versa, so it's not perfect :-/
+      for minfo in $MD5LIST; do if [ "$mf" = "$minfo" ]; then ok='y'; break; fi; done
+      [ "$ok" = 'y' ] || { ${loglevel} -a "${itemid}: Failed md5sum: $(basename "$f")"; log_info -a "  actual md5sum is $mf"; allok='n'; }
+    done
+  fi
+  if [ "${HINT_SHA256IGNORE[$itemid]}" != 'y' -a -n "$SHA256LIST" ]; then
+    for f in "${srcfilelist[@]}"; do
+      sf=$(sha256sum "$f"); sf="${sf/ */}"
+      ok='n'
+      # The next bit checks all files have a good sha256sum, but not vice versa, so it's not perfect :-/
+      for sinfo in $SHA256LIST; do if [ "$sf" = "$sinfo" ]; then ok='y'; break; fi; done
+      [ "$ok" = 'y' ] || { ${loglevel} -a "${itemid}: Failed sha256sum: $(basename "$f")"; log_info -a "  actual sha256sum is $sf"; allok='n'; }
+    done
+  fi
+  if [ "$allok" = 'y' ]; then
+    log_done
+  else
+    [ -n "${HINT_NODOWNLOAD[$itemid]}" ] && return 6
+    return 1
+  fi
+
+  return 0
 }
 
 #-------------------------------------------------------------------------------
@@ -102,13 +112,11 @@ function download_src
 # Download sources into the source cache
 # No arguments -- uses $DOWNDIR, $DOWNLIST and $VERSION previously set by verify_src
 # Return status:
-# 1 - curl failed
+# 1 - download failed
 {
-  [ "$OPT_TRACE" = 'y' ] && echo -e ">>>> ${FUNCNAME[*]}\n     $*" >&2
-
   if [ -n "$DOWNDIR" ]; then
     mkdir -p "$DOWNDIR"
-    find -H "$DOWNDIR" -maxdepth 1 -type f -exec rm {} \;
+    find -H "$DOWNDIR" -maxdepth 1 -type f -exec rm -f {} \;
   else
     return 0
   fi
@@ -119,31 +127,65 @@ function download_src
     return 0
   fi
 
+  curlboredom='--connect-timeout 30 --retry 4'
+  curlprogress='-#'
+  [ "$OPT_VERBOSE" = 'y' ] && curlprogress=''
+  wgetboredom='--dns-timeout=30 --connect-timeout=30 --read-timeout=120 --tries=4'
+  wgetprogress='--quiet --progress=bar:force'
+  [ "$OPT_VERBOSE" = 'y' ] && wgetprogress='--progress=bar:force'
+  [ "$SYS_CURRENT" = 'y' ] && wgetprogress="${wgetprogress}:noscroll --show-progress"
+
   log_normal -a "Downloading source files ..."
-  ( cd "$DOWNDIR"
-    for url in $DOWNLIST; do
-      if [ "$OPT_VERY_VERBOSE" = 'y' ]; then
-        set -o pipefail
-        curl -q -f '-#' -k --connect-timeout 30 --retry 4 --ciphers ALL -J -L -A SlackZilla -O "$url" 2>&1 | tee -a "$ITEMLOG"
-        curlstat=$?
-        set +o pipefail
-      else
-        curl -q -f '-#' -k --connect-timeout 30 --retry 4 --ciphers ALL -J -L -A SlackZilla -O "$url" >> "$ITEMLOG" 2>&1
-        curlstat=$?
-      fi
-      if [ $curlstat != 0 ]; then
-        log_error -a "Download failed: $(print_curl_status $curlstat).\n  $url"
+  cd "$DOWNDIR"
+  for url in $DOWNLIST; do
+    # wget is good for redirects and ftp, but curl's content-disposition is better,
+    # so let's try it this way:
+    dlcmd='wget'
+    case "${HINT_PRAGMA[$itemid]}" in
+      *download_basename*) dlcmd="curl" ;;
+    esac
+    # Some sites refuse to serve documents if the user-agent is wget or curl...
+    # but Dropbox fails to redirect to the actual download if the user-agent *isn't* wget.
+    # (The regex '*dropbox*' gives false positives, but is necessary to cope with
+    # dropboxusercontent.com -- hopefully no false positives refuse wget?)
+    useragent="slackrepo"
+    case "$url" in
+      *dropbox*)  useragent="Wget/1.14" ;;  # this may be a lie, but who cares?
+    esac
+    wgetstat=0
+    curlstat=0
+    if [ "$dlcmd" = 'curl' ]; then
+      curl -q $curlboredom -f $curlprogress -k --ciphers ALL --disable-epsv --ftp-method nocwd -J -L -A "$useragent" -O "$url" 2>&41
+      curlstat=$?
+    else
+      wget $wgetboredom $wgetprogress --no-check-certificate --content-disposition -U "$useragent" "$url" 2>&41
+      wgetstat=$?
+    fi
+    if [ $wgetstat != 0 ] || [ $curlstat != 0 ]; then
+      # Try SlackBuilds Direct :D quietly ;-)
+      sbdurl="https://sourceforge.net/projects/slackbuildsdirectlinks/files/${ITEMPRGNAM[$itemid]}/${url##*/}"
+      # use wget, seeing as it's always https from Sourceforge with its redirect mania
+      # wget failures sometimes leave an incomplete file behind, -r should ensure it is clobbered
+      wget -r $wgetboredom $wgetprogress --no-check-certificate --content-disposition -U "$useragent" "$url" 2>&41
+      sbdstat=$?
+      if [ $sbdstat != 0 ]; then
+        # use the original url and status in the error message
+        [ "$wgetstat" != 0 ] && failmsg="$(print_wget_status $wgetstat)"
+        [ "$curlstat" != 0 ] && failmsg="$(print_curl_status $curlstat)"
+        if [ "$CMD" = 'lint' ]; then
+          log_warning -a "${itemid}: Download failed: ${failmsg}."
+          log_info -a "$url"
+        else
+          log_error -a "Download failed: ${failmsg}.\n  $url"
+        fi
+        cd - >/dev/null
         return 1
       fi
-    done
-    echo "$VERSION" > "$DOWNDIR"/.version
-    # curl content-disposition can't undo %-encoding.
-    # If it's too hard for curl, we'll just zap the obvious ones:
-    for urltrouble in *%*; do
-      [ -e "$urltrouble" ] || break
-      mv "$urltrouble" "$(echo "$urltrouble" | sed -e 's/\%20/ /g' -e 's/\%7E/~/g' -e 's/\%28/(/g' -e 's/\%29/)/g')"
-    done
-  )
+      log_info -a "Downloaded from SlackBuilds Direct Links: ${url##*/}"
+    fi
+  done
+  echo "$VERSION" > "$DOWNDIR"/.version
+  cd - >/dev/null
   return 0
 }
 
@@ -151,10 +193,10 @@ function download_src
 
 function print_curl_status
 # Print a friendly error message for curl status code on standard output
+# http://curl.haxx.se/docs/manpage.html#EXIT
 # $1 = curl status code
 # Return status: always 0
 {
-  [ "$OPT_TRACE" = 'y' ] && echo -e ">>>> ${FUNCNAME[*]}\n     $*" >&2
   case $1 in
   1)   echo "Unsupported protocol" ;;
   2)   echo "Failed to initialize" ;;
@@ -234,6 +276,29 @@ function print_curl_status
   89)  echo "No connection available, the session will be queued " ;;
   '')  echo "curl status is null" ;;
   *)   echo "curl status $1" ;;
+  esac
+  return 0
+}
+
+#-------------------------------------------------------------------------------
+
+function print_wget_status
+# Print a friendly error message for wget status code on standard output
+# https://www.gnu.org/software/wget/manual/wget.html#Exit-Status
+# $1 = wget status code
+# Return status: always 0
+{
+  case $1 in
+  1)   echo "Generic error code" ;;
+  2)   echo "Parse error - for instance, when parsing command-line options or .wgetrc or .netrc" ;;
+  3)   echo "File I/O error" ;;
+  4)   echo "Network failure" ;;
+  5)   echo "SSL verification failure" ;;
+  6)   echo "Username/password authentication failure" ;;
+  7)   echo "Protocol errors" ;;
+  8)   echo "Server issued an error response" ;;
+  '')  echo "wget status is null" ;;
+  *)   echo "wget status $1" ;;
   esac
   return 0
 }

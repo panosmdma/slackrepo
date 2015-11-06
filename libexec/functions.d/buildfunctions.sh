@@ -7,7 +7,6 @@
 #   build_ok
 #   build_failed
 #   build_skipped
-#   do_groupadd_useradd
 #   chroot_setup
 #   chroot_report
 #   chroot_destroy
@@ -28,28 +27,32 @@ function build_item_packages
 # 7 = excessively dramatic qa test fail
 # 8 = package install fail
 {
-  [ "$OPT_TRACE" = 'y' ] && echo -e ">>>> ${FUNCNAME[*]}\n     $*" >&2
-
   local itemid="$1"
   local itemprgnam="${ITEMPRGNAM[$itemid]}"
   local itemdir="${ITEMDIR[$itemid]}"
   local itemfile="${ITEMFILE[$itemid]}"
   local -a pkglist tempdownlist
 
+  buildopt=''
+  [ "$OPT_DRY_RUN" = 'y' ] && buildopt=' [dry run]'
+  [ "$OPT_INSTALL" = 'y' ] && buildopt=' [install]'
+  log_itemstart "$itemid" "Starting $itemid (${STATUSINFO[$itemid]})$buildopt"
+
   MYTMPIN="$MYTMPDIR/slackbuild_$itemprgnam"
   # initial wipe of $MYTMPIN, even if $OPT_KEEP_TMP is set
   rm -rf "$MYTMPIN"
   cp -a "$SR_SBREPO/$itemdir" "$MYTMPIN"
 
-  if [ "$OPT_TEST" = 'y' ]; then
-    test_slackbuild "$itemid" || return 7
+  if [ "$OPT_LINT" = 'y' ]; then
+    test_slackbuild "$itemid"
+    [ $? -gt 1 ] && return 7
   fi
 
   # Apply version hint
   NEWVERSION="${HINT_VERSION[$itemid]}"
   if [ -n "$NEWVERSION" -a "${INFOVERSION[$itemid]}" != "$NEWVERSION" ]; then
     # Fiddle with $VERSION -- usually doomed to failure, but not always ;-)
-    log_verbose -a "Note: $itemid: setting VERSION=$NEWVERSION (was ${INFOVERSION[$itemid]})"
+    log_info -a "Setting VERSION=$NEWVERSION (was ${INFOVERSION[$itemid]})"
     sed -i -e "s/^VERSION=.*/VERSION=$NEWVERSION/" "$MYTMPIN/$itemfile"
     # Let's assume shell globbing chars won't appear in any sane VERSION ;-)
     INFODOWNLIST[$itemid]="${INFODOWNLIST[$itemid]//${INFOVERSION[$itemid]}/$NEWVERSION}"
@@ -65,27 +68,27 @@ function build_item_packages
   if [ -d "$archsourcedir" ]; then
     SOURCESTASH="$archsourcestash"
     mkdir -p "$SOURCESTASH"
-    find "$SOURCESTASH" -type f -maxdepth 1 -exec rm {} \;
+    find "$SOURCESTASH" -type f -maxdepth 1 -exec rm -f {} \;
     find "$archsourcedir" -type f -maxdepth 1 -exec cp {} "$SOURCESTASH" \;
   elif [ -d "$allsourcedir" ]; then
     SOURCESTASH="$allsourcestash"
     mkdir -p "$SOURCESTASH"
-    find "$SOURCESTASH" -type f -maxdepth 1 -exec rm {} \;
+    find "$SOURCESTASH" -type f -maxdepth 1 -exec rm -f {} \;
     find "$allsourcedir" -type f -maxdepth 1 -exec cp {} "$SOURCESTASH" \;
   fi
   # If there were no actual source files, remove the stash directory:
   [ -n "$SOURCESTASH" ] && rmdir --ignore-fail-on-non-empty "$SOURCESTASH"
 
   # Get the source (including check for unsupported/untested/nodownload)
-  verify_src "$itemid"
+  verify_src "$itemid" "log_important"
   case $? in
     0) # already got source, and it's good
-       [ "$OPT_TEST" = 'y' -a -z "${HINT_NODOWNLOAD[$itemid]}" ] && test_download "$itemid"
+       [ "$OPT_LINT" = 'y' -a -z "${HINT_NODOWNLOAD[$itemid]}" ] && test_download "$itemid"
        ;;
     1|2|3|4)
        # already got source but it's bad, or not got source, or wrong version => get it
        download_src "$itemid" || { build_failed "$itemid"; return 2; }
-       verify_src "$itemid" || { log_error -a "${itemid}: Downloaded source is bad"; build_failed "$itemid"; return 3; }
+       verify_src "$itemid" "log_error" || { build_failed "$itemid"; return 3; }
        ;;
     5) # unsupported/untested
        STATUS[$itemid]='unsupported'
@@ -117,7 +120,7 @@ function build_item_packages
   # Work out BUILD
   # Get the value from the SlackBuild
   unset BUILD
-  buildassign=$(grep '^BUILD=' "$MYTMPIN"/"$itemfile")
+  buildassign=$(grep -a '^BUILD=' "$MYTMPIN"/"$itemfile")
   if [ -z "$buildassign" ]; then
     buildassign="BUILD=1"
     log_warning -a "${itemid}: no \"BUILD=\" in $itemfile; using 1"
@@ -168,49 +171,46 @@ function build_item_packages
     PKGTYPE="$SR_PKGTYPE" \
     NUMJOBS="$SR_NUMJOBS"
 
-  SLACKBUILDCMD="sh ./$itemfile"
-  [ -n "$SUDO" ] && [ -x /usr/bin/fakeroot ] && SLACKBUILDCMD="fakeroot $SLACKBUILDCMD"
-  [ "$OPT_VERY_VERBOSE" = 'y' ] && [ "$DOCOLOUR"  = 'y' ] && SLACKBUILDCMD="/usr/libexec/slackrepo/unbuffer $SLACKBUILDCMD"
+  SLACKBUILDOPTS="env"
+  SLACKBUILDRUN="sh ./$itemfile"
 
-  # Process other hints for the build:
+  # Process options and hints for the build:
 
-  # NUMJOBS (with MAKEFLAGS and NUMJOBS env vars) ...
+  # ... NUMJOBS (with MAKEFLAGS and NUMJOBS env vars) ...
   NUMJOBS="${HINT_NUMJOBS[$itemid]:-$SR_NUMJOBS}"
-  tempmakeflags="MAKEFLAGS='${HINT_NUMJOBS[$itemid]:-$SR_NUMJOBS}'"
+  SLACKBUILDOPTS="${SLACKBUILDOPTS} MAKEFLAGS='${HINT_NUMJOBS[$itemid]:-$SR_NUMJOBS}'"
 
   # ... OPTIONS ...
-  options="${HINT_OPTIONS[$itemid]}"
-  [ -n "$tempmakeflags" -o -n "$options" ] && SLACKBUILDCMD="env $tempmakeflags $options $SLACKBUILDCMD"
+  [ -n "${HINT_OPTIONS[$itemid]}" ] && SLACKBUILDOPTS="${SLACKBUILDOPTS} ${HINT_OPTIONS[$itemid]}"
 
   # ... ANSWER ...
-  [ -n "${HINT_ANSWER[$itemid]}" ] && SLACKBUILDCMD="echo -e '${HINT_ANSWER[$itemid]}' | $SLACKBUILDCMD"
+  [ -n "${HINT_ANSWER[$itemid]}" ] && SLACKBUILDOPTS="echo -e '${HINT_ANSWER[$itemid]}' | $SLACKBUILDOPTS"
 
-  # ... and SPECIAL.
-  noremove='n'
-  for special in ${HINT_SPECIAL[$itemid]}; do
-    case "$special" in
+  # ... PRAGMA ...
+  hintnoremove='n'
+  hintnofakeroot='n'
+  restorevars=''
+  removestubs=''
+  for pragma in ${HINT_PRAGMA[$itemid]}; do
+    case "$pragma" in
     'multilib_ldflags' )
       if [ "$SYS_MULTILIB" = 'y' ]; then
         # This includes the rare case when an i486 cross-compile on x86_64 needs -L/usr/lib
-        log_verbose "Special action: multilib_ldflags"
+        log_info -a "Pragma: multilib_ldflags"
         libdirsuffix=''
         [ "$SR_ARCH" = 'x86_64' ] && libdirsuffix='64'
         sed -i -e "s;^\./configure ;LDFLAGS=\"-L/usr/lib$libdirsuffix\" &;" "$MYTMPIN/$itemfile"
       fi
       ;;
     'stubs-32' )
-      if [ "$SYS_ARCH" = 'x86_64' -a "$SYS_MULTILIB" = 'n' -a ! -e /usr/include/gnu/stubs-32.h ]; then
-        log_verbose "Special action: stubs-32"
-        ln -s /usr/include/gnu/stubs-64.h /usr/include/gnu/stubs-32.h
-        if [ -z "${HINT_CLEANUP[$itemid]}" ]; then
-          HINT_CLEANUP[$itemid]="rm /usr/include/gnu/stubs-32.h"
-        else
-          HINT_CLEANUP[$itemid]="${HINT_CLEANUP[$itemid]}; rm /usr/include/gnu/stubs-32.h"
-        fi
+      if [ "$SYS_ARCH" = 'x86_64' ] && [ ! -e /usr/include/gnu/stubs-32.h ]; then
+        log_info -a "Pragma: stubs-32"
+        cp -a /usr/share/slackrepo/stubs-32.h /usr/include/gnu/
+        removestubs='y'
       fi
       ;;
     'download_basename' )
-      log_verbose "Special action: download_basename"
+      log_info -a "Pragma: download_basename"
       # We're going to guess that the timestamps in the source repo indicate the
       # order in which files were downloaded and therefore the order in INFODOWNLIST.
       # Most of the current bozo downloaders only download one file anyway :-)
@@ -227,100 +227,145 @@ function build_item_packages
       done < <(ls -rt "$SR_SRCREPO"/"$itemdir" 2>/dev/null)
       ;;
     'no_make_test' )
-      log_verbose "Special action: no_make_test"
+      log_info -a "Pragma: no_make_test"
       sed -i -e "s/make test/: # make test/" "$MYTMPIN"/"$itemfile"
       ;;
     'noexport_ARCH' )
-      log_verbose "Special action: noexport_ARCH"
+      log_info -a "Pragma: noexport_ARCH"
       sed -i -e "s/^PRGNAM=.*/&; ARCH='$SR_ARCH'/" "$MYTMPIN"/"$itemfile"
       unset ARCH
       ;;
-    'noexport_BUILD' )
-      log_verbose "Special action: noexport_BUILD"
-      sed -i -e "s/^BUILD=.*/BUILD='$BUILD'/" "$MYTMPIN"/"$itemfile"
-      unset BUILD
+    'noexport_BUILD' | 'noexport_TAG' )
+      log_info -a "Pragma: ${pragma}"
+      var="${pragma/noexport_/}"
+      sed -i -e "s/^${var}=.*/${var}='${!var}'/" "$MYTMPIN"/"$itemfile"
+      unset "${var}"
       ;;
     'unset'* )
-      eval "${special/_/ }"
+      varname="${pragma/unset_/}"
+      assignment="$(env | grep "^${varname}=")"
+      if [ -n "$assignment" ]; then
+        log_info -a "Pragma: ${pragma}"
+        restorevars="${restorevars}export $(echo "${assignment}" | sed -e 's/^/\"/' -e 's/$/\"/'); "
+        eval "unset ${varname}"
+      fi
       ;;
     'noremove' )
-      log_verbose "Special action: noremove"
-      noremove='y'
+      log_info -a "Pragma: noremove"
+      hintnoremove='y'
+      ;;
+    'nofakeroot' )
+      log_info -a "Pragma: nofakeroot"
+      hintnofakeroot='y'
+      ;;
+    'abstar' )
+      log_info -a "Pragma: abstar"
+      sed -i -e "s/^tar .*/& --absolute-names/" "$MYTMPIN"/"$itemfile"
       ;;
     * )
-      log_warning "${itemid}: Hint SPECIAL=\"$special\" not recognised"
+      log_warning -a "${itemid}: Hint PRAGMA=\"$pragma\" not recognised"
       ;;
     esac
   done
+
+  # ... fakeroot ...
+  if [ -n "$SUDO" ] && [ -x /usr/bin/fakeroot ]; then
+    if [ "$hintnofakeroot" = 'y' ]; then
+      SLACKBUILDRUN="${SUDO}${SLACKBUILDRUN}"
+    else
+      SLACKBUILDRUN="fakeroot ${SLACKBUILDRUN}"
+    fi
+  fi
+
+  # ... nice ...
+  [ "${OPT_NICE:-0}" != '0' ] && SLACKBUILDRUN="nice -n $OPT_NICE $SLACKBUILDRUN"
+
+  # ... and finally, VERBOSE/--color
+  [ "$OPT_VERBOSE" = 'y' ] && [ "$DOCOLOUR" = 'y' ] && SLACKBUILDRUN="/usr/libexec/slackrepo/unbuffer $SLACKBUILDRUN"
+
+  # Finished assembling the command line.
+  SLACKBUILDCMD="${SLACKBUILDOPTS} ${SLACKBUILDRUN}"
 
   # Setup the chroot
   # (to be destroyed below, or by build_failed if necessary)
   chroot_setup
 
-  # Process GROUPADD and USERADD hints, preferably inside the chroot :-)
-  do_groupadd_useradd "$itemid"
-
   # Get all dependencies installed
-  install_deps "$itemid" || { build_failed "$itemid"; return 1; }
+  install_deps "$itemid"
+  if [ $? != 0 ]; then
+    build_failed "$itemid"
+    [ -n "$restorevars" ] && eval "$restorevars"
+    return 1
+  fi
 
   # Remove any existing packages for the item to be built
   # (some builds fail if already installed)
   # (... this might not be entirely appropriate for gcc or glibc ...)
-  if [ "$noremove" != 'y' ]; then
+  if [ "$hintnoremove" != 'y' ]; then
     uninstall_packages "$itemid"
+  fi
+
+  # Process GROUPADD and USERADD hints, preferably inside the chroot :-)
+  if [ -n "${HINT_GROUPADD[$itemid]}" ] || [ -n "${HINT_USERADD[$itemid]}" ]; then
+    log_info -a "Adding groups and users:"
+    if [ -n "${HINT_GROUPADD[$itemid]}" ]; then
+      log_info -a "  ${HINT_GROUPADD[$itemid]}"
+      eval $(echo "${HINT_GROUPADD[$itemid]}" | sed "s#groupadd #${CHROOTCMD}${SUDO}groupadd #g")
+    fi
+    if [ -n "${HINT_USERADD[$itemid]}" ]; then
+      log_info -a "  ${HINT_USERADD[$itemid]}"
+      eval $(echo "${HINT_USERADD[$itemid]}" | sed "s#useradd #${CHROOTCMD}${SUDO}useradd #g")
+    fi
   fi
 
   # Remember the build start time and estimate the build finish time
   estbuildsecs=''
   read prevsecs prevmhz guessflag < <(db_get_buildsecs "$itemid")
-  if [ -n "$prevsecs" ] && [ -n "$prevmhz" ]; then
-    if [ "$guessflag" = '=' ] || [ "$prevsecs" -lt 120 ] || [ "${BOGOCOUNT:-0}" -lt 5 ]; then
-      estbuildsecs=$(echo "scale=3; ${prevsecs}*${prevmhz}/${SYS_MHz}+1" | bc | sed 's/\..*//')
-    elif [ "$guessflag" = '~' ]; then
-      BOGOSLOPE=$(echo "scale=3; (($BOGOCOUNT*$BOGOSUMXY)-($BOGOSUMX*$BOGOSUMY))/(($BOGOCOUNT*$BOGOSUMX2)-($BOGOSUMX*$BOGOSUMX))" | bc)
-      BOGOCONST=$(echo "scale=3; ($BOGOSUMY - ($BOGOSLOPE*$BOGOSUMX))/$BOGOCOUNT*60.0" | bc)
-      estbuildsecs=$(echo "scale=3; $BOGOSLOPE*(${prevsecs}*${prevmhz}/${SYS_MHz})+$BOGOCONST+1" | bc | sed 's/\..*//')
-    fi
+  if [ -n "$prevsecs" ] && [ -n "$prevmhz" ] && [ -n "$SYS_MHz" ]; then
+    estbuildsecs=$(echo "scale=3; ${prevsecs}*${prevmhz}/${SYS_MHz}+1" | bc | sed 's/\..*//')
   fi
   buildstarttime="$(date '+%s')"
   eta=""
   if [ -n "$estbuildsecs" ]; then
     eta="ETA $(date --date=@"$(( buildstarttime + estbuildsecs + 30 ))" '+%H:%M'):??"
-    [ "$guessflag" = '~' ] && [ "$estbuildsecs" -gt "600" ] && eta="${eta:0:8}?:??"
-    [ "$guessflag" = '~' ] && eta="eta ~${eta:4:4}?:??"
+    [ "$guessflag" = '~' ] && [ "$estbuildsecs" -gt "1200" ] && eta="${eta:0:8}?:??"
+    [ "$guessflag" = '~' ] && eta="eta ~${eta:4:8}"
   fi
 
   # Build it
   touch "$MYTMPDIR"/start
-  runmsg=$(format_left_right "Running $itemfile ..." "$eta")
-  log_normal -a "$runmsg"
-  log_verbose -a "$SLACKBUILDCMD"
-  if [ "$OPT_VERY_VERBOSE" = 'y' ]; then
-    echo ''
-    echo '---->8-------->8-------->8-------->8-------->8-------->8-------->8-------->8---'
-    echo ''
+  log_normal -a "Running $itemfile ..." "$eta"
+  log_info -a "$SLACKBUILDCMD"
+  if [ "$OPT_VERBOSE" = 'y' ]; then
+    log_verbose '\n---->8-------->8-------->8-------->8-------->8-------->8-------->8-------->8----\n' >&41
     set -o pipefail
     if [ "$SYS_MULTILIB" = "y" ] && [ "$ARCH" = 'i486' -o "$ARCH" = 'i686' ]; then
-      ${CHROOTCMD}sh -c ". /etc/profile.d/32dev.sh; cd \"${MYTMPIN}\"; ${SLACKBUILDCMD}" 2>&1 | tee -a "$ITEMLOG"
+      ${CHROOTCMD}sh -c ". /etc/profile.d/32dev.sh; cd \"${MYTMPIN}\"; ${SLACKBUILDCMD}" 2>&1 | \
+        tee >(sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/\x1b[()].//' -e 's/\x0e//g' -e 's/\x0f//g' >>"$ITEMLOG") >&41
       buildstat=$?
     else
-      ${CHROOTCMD}sh -c "cd \"${MYTMPIN}\"; ${SLACKBUILDCMD}" 2>&1 | tee -a "$ITEMLOG"
+      ${CHROOTCMD}sh -c "cd \"${MYTMPIN}\"; ${SLACKBUILDCMD}" 2>&1 | \
+        tee >(sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/\x1b[()].//' -e 's/\x0e//g' -e 's/\x0f//g' >>"$ITEMLOG") >&41
       buildstat=$?
     fi
     set +o pipefail
-    echo '----8<--------8<--------8<--------8<--------8<--------8<--------8<--------8<---'
-    echo ''
+    log_verbose '\n----8<--------8<--------8<--------8<--------8<--------8<--------8<--------8<----\n' >&41
   else
-    if [ "$SYS_MULTILIB" = "y" -a "$ARCH" = 'i486' ]; then
-      ${CHROOTCMD}sh -c ". /etc/profile.d/32dev.sh; cd \"${MYTMPIN}\"; ${SLACKBUILDCMD}" >> "$ITEMLOG" 2>&1
+    if [ "$SYS_MULTILIB" = "y" ] && [ "$ARCH" = 'i486' -o "$ARCH" = 'i686' ]; then
+      ${CHROOTCMD}sh -c ". /etc/profile.d/32dev.sh; cd \"${MYTMPIN}\"; ${SLACKBUILDCMD}" \
+        &> >(sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/\x1b[()].//' -e 's/\x0e//g' -e 's/\x0f//g' >>"$ITEMLOG")
       buildstat=$?
     else
-      ${CHROOTCMD}sh -c "cd \"${MYTMPIN}\"; ${SLACKBUILDCMD}" >> "$ITEMLOG" 2>&1
+      ${CHROOTCMD}sh -c "cd \"${MYTMPIN}\"; ${SLACKBUILDCMD}" \
+        &> >(sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/\x1b[()].//' -e 's/\x0e//g' -e 's/\x0f//g' >>"$ITEMLOG")
       buildstat=$?
     fi
   fi
+
   buildfinishtime="$(date '+%s')"
   unset ARCH BUILD TAG TMP OUTPUT PKGTYPE NUMJOBS
+  [ -n "$restorevars" ] && eval "$restorevars"
+  [ -n "$removestubs" ] && rm /usr/include/gnu/stubs-32.h
 
   # If there's a config.log in the obvious place, save it
   configlog="${CHROOTDIR}${SR_TMP}/${itemprgnam}-${INFOVERSION[$itemid]}/config.log"
@@ -329,7 +374,7 @@ function build_item_packages
   fi
 
   if [ "$buildstat" != 0 ]; then
-    log_error -a "${itemid}: $itemfile failed (status $buildstat)"
+    log_error -a "${itemid}: $itemfile failed (status $buildstat)" "$(date +%T)"
     build_failed "$itemid"
     return 1
   fi
@@ -361,7 +406,7 @@ function build_item_packages
           if [ "$currtag" != "$SR_TAG" ]; then
             # retag it. If it's not found, sod it...
             pkgtype=$(echo "$pkgnam" | rev | cut -f1 -d- | rev | sed 's/^[0-9]*//' | sed 's/^.*\.//')
-            mv "${CHROOTDIR}$pkgpath" "$MYTMPOUT"/"${pkgnam/%$currtag.$pkgtype/${SR_TAG}.$pkgtype}"
+            mv "${CHROOTDIR}$pkgpath" "$MYTMPOUT"/"${pkgnam/$currtag.$pkgtype/${SR_TAG}.$pkgtype}"
           else
             mv "${CHROOTDIR}$pkgpath" "$MYTMPOUT"/
           fi
@@ -375,46 +420,38 @@ function build_item_packages
     fi
   fi
 
-  # update pkgnam to itemid table
-  if [ "$OPT_DRY_RUN" != 'y' ]; then
-    db_del_pkgnam_itemid "$itemid"
-    for pkgpath in "${pkglist[@]}"; do
-      pkgbasename=$(basename "$pkgpath")
-      log_important "Built ok:  $pkgbasename"
-      pkgnam=$(echo "$pkgbasename" | rev | cut -f4- -d- | rev)
-      db_set_pkgnam_itemid "$pkgnam" "$itemid"
-    done
-  fi
   # update build time information
   # add 1 to round it up so it's never zero
   actualsecs=$(( buildfinishtime - buildstarttime + 1 ))
   db_set_buildsecs "$itemid" "$actualsecs"
-  if [ -n "$estbuildsecs" ]; then
-    secsdiff=$(( actualsecs - estbuildsecs ))
-    if [ "$guessflag" = '~' ] && [ "${estbuildsecs:-0}" -gt 120 ] && [ "${secsdiff//-/}" -gt 30 ] && [ "${BOGOCOUNT:-0}" -lt 200 ]; then
-      # yes, this is crazy :P ... 200 data points should be enough. We use minutes to prevent the numbers getting enormous.
-      BOGOCOUNT=$(( BOGOCOUNT + 1 ))
-      BOGOSUMX=$(echo "scale=3; $BOGOSUMX+$estbuildsecs/60.0" | bc)
-      BOGOSUMY=$(echo "scale=3; $BOGOSUMY+$actualsecs/60.0"   | bc)
-      BOGOSUMX2=$(echo "scale=3; $BOGOSUMX2 + ($estbuildsecs/60.0)*($estbuildsecs/60.0)" | bc)
-      BOGOSUMXY=$(echo "scale=3; $BOGOSUMXY + ($estbuildsecs/60.0)*($actualsecs/60.0)"   | bc)
-      db_set_misc bogostuff "BOGOCOUNT=$BOGOCOUNT; BOGOSUMX=$BOGOSUMX; BOGOSUMY=$BOGOSUMY; BOGOSUMX2=$BOGOSUMX2; BOGOSUMXY=$BOGOSUMXY;"
-    fi
-  fi
+
+  # update pkgnam to itemid table (do this before any attempt to install)
+  #### [ "$OPT_DRY_RUN" != 'y' ] && db_del_itemid_pkgnam "$itemid" ####
+  #### need something in the db if we just did a dry run of a new item
+  #### (but what about an old item where the package names changed?)
+  db_del_itemid_pkgnam "$itemid"
+  for pkgpath in "${pkglist[@]}"; do
+    pkgbasename=$(basename "$pkgpath")
+    log_important -a "Built ok:  $pkgbasename" "$(date +%T)"
+    #### if [ "$OPT_DRY_RUN" != 'y' ]; then ####
+      pkgnam=$(echo "$pkgbasename" | rev | cut -f4- -d- | rev)
+      db_set_pkgnam_itemid "$pkgnam" "$itemid"
+    #### fi ####
+  done
 
   [ "$OPT_CHROOT" = 'y' ] && chroot_report
 
-  if [ "$OPT_TEST" = 'y' ]; then
-    test_package "$itemid" "${pkglist[@]}" || { build_failed "$itemid"; return 7; }
+  if [ "$OPT_LINT" = 'y' ]; then
+    test_package "$itemid" "${pkglist[@]}"
+    [ $? -gt 1 ] && { build_failed "$itemid"; return 7; }
   fi
 
   [ "$OPT_CHROOT" = 'y' ] && chroot_destroy
   rm -f "$MYTMPDIR"/start 2>/dev/null
 
   if [ "${HINT_INSTALL[$itemid]}" = 'y' ] || [ "$OPT_INSTALL" = 'y' -a "${HINT_INSTALL[$itemid]}" != 'n' ]; then
-    #### what about dry run?
-    install_packages "$itemid" || { build_failed "$itemid"; return 8; }
-    #### set the new pkgbase in KEEPINSTALLED[$pkgid]
+    install_packages "${pkglist[@]}" || { build_failed "$itemid"; return 8; }
+    #### set the new pkgbase in KEEPINSTALLED[$pkgnam] ????
   else
     uninstall_deps "$itemid"
   fi
@@ -432,14 +469,10 @@ function build_ok
 # $1 = itemid
 # Return status: always 0
 {
-  [ "$OPT_TRACE" = 'y' ] && echo -e ">>>> ${FUNCNAME[*]}\n     $*" >&2
-
   local itemid="$1"
   local itemprgnam="${ITEMPRGNAM[$itemid]}"
   local itemdir="${ITEMDIR[$itemid]}"
   local itemfile="${ITEMFILE[$itemid]}"
-
-  STATUS[$itemid]="ok"
 
   [ "$OPT_KEEP_TMP" != 'y' ] && rm -rf "$MYTMPIN"
 
@@ -459,9 +492,10 @@ function build_ok
         mkdir -p "$(dirname "$backupdir")"
       fi
       mv "$SR_PKGREPO"/"$itemdir" "$backupdir"
-      rm -rf "$backupdir".prev
+      rm -rf "${backupdir:?NotSetBackupdir}".prev
       # if there's a stashed source, save it to the backup repo
       if [ -d "$SOURCESTASH" ]; then
+        rm -rf "${backupdir:?NotSetBackupdir}"/"$(basename "${SOURCESTASH/prev_/}")"
         mv "$SOURCESTASH" "$backupdir"/"$(basename "${SOURCESTASH/prev_/}")"
       fi
       # save old revision data to a file in the backup repo
@@ -477,7 +511,7 @@ function build_ok
       # log what happened
       for backpack in "$backupdir"/*.t?z; do
         [ -e "$backpack" ] || break
-        log_verbose "Backed up: $(basename "$backpack")"
+        log_info -a "Backed up: $(basename "$backpack")"
       done
     else
       rm -rf "${SR_PKGREPO:?NotSetSR_PKGREPO}"/"$itemdir"/*
@@ -495,6 +529,7 @@ function build_ok
   buildopt=''
   [ "$OPT_DRY_RUN" = 'y' ] && buildopt=' [dry run]'
   [ "$OPT_INSTALL" = 'y' ] && buildopt=' [install]'
+  STATUS[$itemid]="ok"
   STATUSINFO[$itemid]="$CHANGEMSG$buildopt"
   log_itemfinish "${itemid}" 'ok' "${STATUSINFO[$itemid]}"
 
@@ -508,21 +543,14 @@ function build_failed
 # $1 = itemid
 # Return status: always 0
 {
-  [ "$OPT_TRACE" = 'y' ] && echo -e ">>>> ${FUNCNAME[*]}\n     $*" >&2
-
   local itemid="$1"
   local itemprgnam="${ITEMPRGNAM[$itemid]}"
   local itemdir="${ITEMDIR[$itemid]}"
   local itemfile="${ITEMFILE[$itemid]}"
 
   STATUS[$itemid]="failed"
-
-  if [ "$OPT_QUIET" != 'y' ]; then
-    errorscan_itemlog | tee -a "$MAINLOG"
-  else
-    errorscan_itemlog >> "$MAINLOG"
-  fi
   STATUSINFO[$itemid]="See $ITEMLOG"
+  log_info -t "$(errorscan_itemlog)"
   log_error -n "${STATUSINFO[$itemid]}"
 
   if [ -n "${CHROOTDIR}" ]; then
@@ -551,7 +579,6 @@ function build_skipped
 # $3 = extra message for next line (optional -- supplied to log_itemfinish as $4)
 # Return status: always 0
 {
-  [ "$OPT_TRACE" = 'y' ] && echo -e ">>>> ${FUNCNAME[*]}\n     $*" >&2
   local itemid="$1"
   local itemprgnam="${ITEMPRGNAM[$itemid]}"
 
@@ -566,76 +593,6 @@ function build_skipped
 
 #-------------------------------------------------------------------------------
 
-function do_groupadd_useradd
-# If there is a GROUPADD or USERADD hint for this item, set up the group and username.
-# GROUPADD hint format: GROUPADD="<gnum>:<gname> ..."
-# USERADD hint format:  USERADD="<unum>:<uname>:[-g<ugroup>:][-d<udir>:][-s<ushell>:][-uargs:...] ..."
-#   but if the USERADD hint is messed up, we can take a wild guess or two, see below ;-)
-# $1 = itemid
-# Return status: always 0
-{
-  [ "$OPT_TRACE" = 'y' ] && echo -e ">>>> ${FUNCNAME[*]}\n     $*" >&2
-
-  local itemid="$1"
-  local itemprgnam="${ITEMPRGNAM[$itemid]}"
-
-  if [ -n "${HINT_GROUPADD[$itemid]}" ]; then
-    for groupstring in ${HINT_GROUPADD[$itemid]}; do
-      gnum=''; gname="$itemprgnam"
-      for gfield in $(echo "$groupstring" | tr ':' ' '); do
-        case "$gfield" in
-          [0-9]* ) gnum="$gfield" ;;
-          * ) gname="$gfield" ;;
-        esac
-      done
-      [ -z "$gnum" ] && { log_warning "${itemid}: GROUPADD hint has no GID number" ; break ; }
-      if ! getent group "$gname" | grep -q "^${gname}:" 2>/dev/null ; then
-        gaddcmd="groupadd -g $gnum $gname"
-        log_verbose -a "Adding group: $gaddcmd"
-        eval "${CHROOTCMD}${SUDO}$gaddcmd"
-      else
-        log_verbose -a "Group $gname already exists."
-      fi
-    done
-  fi
-
-  if [ -n "${HINT_USERADD[$itemid]}" ]; then
-    for userstring in ${HINT_USERADD[$itemid]}; do
-      unum=''; uname="$itemprgnam"; ugroup=""
-      udir='/dev/null'; ushell='/bin/false'; uargs=''
-      for ufield in $(echo "$userstring" | tr ':' ' '); do
-        case "$ufield" in
-          -g* ) ugroup="${ufield:2}" ;;
-          -d* ) udir="${ufield:2}" ;;
-          -s* ) ushell="${ufield:2}" ;;
-          -*  ) uargs="$uargs ${ufield:0:2} ${ufield:2}" ;;
-          /*  ) if [ -x "$ufield" ]; then ushell="$ufield"; else udir="$ufield"; fi ;;
-          [0-9]* ) unum="$ufield" ;;
-          *   ) uname="$ufield" ;;
-        esac
-      done
-      [ -z "$unum" ] && { log_warning "${itemid}: USERADD hint has no UID number" ; break ; }
-      if ! getent passwd "$uname" | grep -q "^${uname}:" 2>/dev/null ; then
-        [ -z "$ugroup" ] && ugroup="$uname"
-        if ! getent group "${ugroup}" | grep -q "^${ugroup}:" 2>/dev/null ; then
-          gaddcmd="groupadd -g $unum $ugroup"
-          log_verbose -a "Adding group: $gaddcmd"
-          eval "${CHROOTCMD}${SUDO}$gaddcmd"
-        fi
-        uaddcmd="useradd  -u $unum -g $ugroup -c $itemprgnam -d $udir -s $ushell $uargs $uname"
-        log_verbose -a "Adding user:  $uaddcmd"
-        eval "${CHROOTCMD}${SUDO}$uaddcmd"
-      else
-        log_verbose -a "User $uname already exists."
-      fi
-    done
-  fi
-
-  return 0
-}
-
-#-------------------------------------------------------------------------------
-
 function chroot_setup
 # Setup a temporary chroot environment at $MYTMPDIR/chroot using overlayfs
 # Also sets the global variables $CHROOTCMD and $CHROOTDIR
@@ -643,7 +600,6 @@ function chroot_setup
 # 0 = it worked
 # 1 = OPT_CHROOT is not set, or could not mount the overlay
 {
-  [ "$OPT_TRACE" = 'y' ] && echo -e ">>>> ${FUNCNAME[*]}\n     $*" >&2
   CHROOTCMD=''
   [ "$OPT_CHROOT" != 'y' ] && return 1
   mkdir -p "$MYTMPDIR"/{changes,workdir,chroot}
@@ -655,12 +611,13 @@ function chroot_setup
   # ${SUDO}mount -t devpts  devpts  -ogid=5,mode=620 "$CHROOTDIR"/dev/pts
   # ${SUDO}mount -t sysfs   sysfs   "$CHROOTDIR"/sys
   if [ -n "$SUDO" ] && [ ! -d "${CHROOTDIR}/${HOME}" ]; then
-    # create $HOME as an empty directory
+    # create $HOME as a (mostly) empty directory
     ${SUDO}mkdir -p "${CHROOTDIR}/${HOME}"
     ${SUDO}chown "${EUID}" "${CHROOTDIR}/${HOME}"
+    [ -f ~/.Xauthority ] && cp -a ~/.Xauthority "${CHROOTDIR}/${HOME}"
   fi
   CHROOTCMD="chroot ${CHROOTDIR} "  # note the trailing space
-  [ -n "$SUDO" ] && CHROOTCMD="sudo chroot --userspec=${USER} ${CHROOTDIR} "
+  [ -n "$SUDO" ] && CHROOTCMD="${SUDO} chroot --userspec=${USER} ${CHROOTDIR} "
   return 0
 }
 
@@ -670,17 +627,16 @@ function chroot_report
 # Warn about modified files and directories in the chroot
 # Return status: always 0
 {
-  [ "$OPT_TRACE" = 'y' ] && echo -e ">>>> ${FUNCNAME[*]}\n     $*" >&2
   [ -z "$CHROOTDIR" ] && return 0
 
   if [ -f "$MYTMPDIR"/start ]; then
-    crap=$(cd "$MYTMPDIR"/changes; find . -path './tmp' -prune -o -newer ../start -print 2>/dev/null)
+    crap=$(cd "$MYTMPDIR"/changes; find . -path './tmp' -prune -o  -path ".$HOME/.*/*" -prune -o -newer ../start -print 2>/dev/null)
     if [ -n "$crap" ]; then
-      excludes="^/dev/ttyp|^$HOME/.distcc|^$HOME/.cache/g-ir-scanner|^$HOME\$"
+      excludes="^/dev/ttyp|^$HOME/.distcc|^$HOME/.cache|^$HOME\$"
       significant="$(echo "$crap" | sed -e "s#^\./#/#" | grep -v -E "$excludes" | sort)"
       if [ -n "$significant" ]; then
-        log_warning "$itemid: Files/directories were modified during the build"
-        printf "  %s\n" ${significant}
+        log_warning -a "$itemid: Files/directories were modified in the chroot"
+        log_info -t -a "${significant}"
       fi
     fi
   fi
@@ -694,9 +650,8 @@ function chroot_destroy
 # Unmount the chroot, copy any wanted files, and then destroy it
 # Return status: always 0
 {
-  [ "$OPT_TRACE" = 'y' ] && echo -e ">>>> ${FUNCNAME[*]}\n     $*" >&2
   [ -z "$CHROOTDIR" ] && return 0
-  log_normal "Unmounting chroot ... "
+  log_normal -a "Unmounting chroot ... "
   ${SUDO}umount "$CHROOTDIR"/dev/shm || return 0
   ${SUDO}umount "$CHROOTDIR"/proc || return 0
   ${SUDO}umount -l "$CHROOTDIR" || return 0

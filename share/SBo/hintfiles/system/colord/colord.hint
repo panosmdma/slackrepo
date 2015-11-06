@@ -1,3 +1,0 @@
-ADDREQUIRES="vala"
-GROUPADD="297:colord"
-USERADD="297:colord:-d/var/lib/colord:-s/bin/false"

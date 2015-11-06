@@ -1,7 +1,7 @@
 .\" Copyright 2014 David Spencer, Baildon, West Yorkshire, U.K.
 .\" All rights reserved.  For licence details, see the file 'LICENCE'.
 .
-.TH SLACKREPO.HINT 5 "2014-06-01" slackrepo-0.1.0
+.TH SLACKREPO.HINT 5 "2015-05-01" slackrepo-0.2.0
 .
 .
 .
@@ -25,30 +25,37 @@ A \(dqhintfile\(dq is a file that supplements a SlackBuild's .info file, for
 example to specify options and additional dependencies, to override the version,
 downloads and md5sums, etc.
 .P
-Each repository ID should have its own hint directory, as configured in the
-configuration file (see
+Each repository ID should have a local hintfiles directory, as configured
+by the HINTDIR variable in the configuration file (see
 .BR slackrepo.conf (5)).
 By default this will be
 .IR /etc/slackrepo/ID/hintfiles .
 .P
-The hintfiles directory should contain a structure of subdirectories that is the
-same as the subdirectories in the SlackBuilds repository.
+The local hintfiles directory can optionally contain a structure of subdirectories
+that is the same as the subdirectories in the SlackBuilds repository.
 For example, if the SBo repository's SlackBuild file for wxPython is
 .IR libraries/wxPython/wxPython.SlackBuild ,
-then its hintfile will be
-.IR /etc/slackrepo/hints_SBo/libraries/wxPython/wxPython.hint .
+then its hintfile would be
+.IR /etc/slackrepo/SBo/hintfiles/libraries/wxPython/wxPython.hint .
+Alternatively, hintfiles can be placed in the top level directory, for example
+.IR /etc/slackrepo/SBo/hintfiles/wxPython.hint .
+A hintfile in the top level directory takes precedence over a hintfile
+of the same name in a subdirectory.
 .P
-Alternatively, hintfiles can be placed in the top level hintfiles directory.
+Each repository ID should also have a default hint directory
+for system supplied hintfiles,
+as configured by the DEFAULT_HINTDIR variable
+in the configuration file (see
+.BR slackrepo.conf (5)).
+For example, the SlackBuilds.org default hintfiles for Slackware 14.1 are
+supplied in the directory
+.IR /usr/share/slackrepo/SBo/default_hintfiles/14.1 .
+The default hintfiles directory contains a structure of subdirectories
+that is the same as the subdirectories in the SlackBuilds repository.
 .P
-A set of example hintfiles for SlackBuilds.org are supplied in the directory
-.IR /usr/share/slackrepo/SBo/hintfiles .
-.B The example hintfiles are ignored.
-You must copy the example hintfiles to
-.IR /etc/slackrepo/SBo/hintfiles ,
-then review the README files of the packages you are
-building, and then edit the hintfiles in 
-.I /etc/slackrepo/SBo/hintfiles
-for your own choices.
+Local hintfiles always take precedence over default hintfiles.
+You can disable the default hintfile directory completely by unsetting the
+DEFAULT_HINTDIR variable.
 .P
 The format of a hintfile is based on the format of SlackBuilds.org .info files,
 but all the entries are optional, and any unrecognised entries are ignored.
@@ -59,8 +66,10 @@ The entries that can be defined are as follows:
 VERSION=\(dqnewversion\(dq
 DOWNLOAD=\(dqnew urls\(dq
 MD5SUM=\(dqnew md5sums\(dq
+SHA256SUM=\(dqsha256sum\(dq
 DOWNLOAD_arch=\(dqnew urls\(dq
 MD5SUM_arch=\(dqnew md5sums\(dq
+SHA256SUM_arch=\(dqsha256sum\(dq
 ADDREQUIRES=\(dqadditional dependencies\(dq
 OPTIONS=\(dqOPT1=yes OPT2=no ...\(dq
 GROUPADD=\(dqgid:groupname ...\(dq
@@ -71,7 +80,7 @@ INSTALL=\(dqyesno\(dq
 NUMJOBS=\(dq-j1\(dq
 ANSWERS=\(dqstrings\(dq
 CLEANUP=\(dqcommands\(dq
-SPECIAL=\(dqactions\(dq
+PRAGMA=\(dqpragmas\(dq
 .EE
 .RE
 .
@@ -83,9 +92,9 @@ This hint can be specified to attempt an automatic patch of the version number
 in both the SlackBuild and info files. The automatic patch is done by a simple text substitution.
 This often won't work (particularly if the old version number is something like '1', or
 if the download URL has not been patched correctly and you have not supplied a new
-download URL in the hint file). The md5sum of the source archive will not be checked,
-unless you have also supplied a new md5sum in the hint file.
-The patched SlackBuild and info files are not kept.
+download URL in the hint file). The md5sum and/or sha256sum of the source archive will not be checked, unless you have
+also supplied a new md5sum and/or sha256sum in the hint file. The patched SlackBuild and info
+files are not kept.
 .
 .
 .SS DOWNLOAD=\(dqnew urls\(dq
@@ -114,9 +123,15 @@ this hint indicates that the source md5sums are not reliable
 (for example, because of an unversioned archive) and should not be checked.
 .
 .
-.SS DOWNLOAD_arch=\(dqnew urls\(dq and MD5SUM_arch=\(dqnew md5sums\(dq
+.SS SHA256SUM=\(dqsha256sums\(dq
 .P
-These hints redefine DOWNLOAD and MD5SUM, as above, for the specified arch.
+This hint specifies an sha256sum that will be checked (in addition to any md5sum).
+.
+.
+.SS DOWNLOAD_arch=\(dqnew urls\(dq and MD5SUM_arch=\(dqnew md5sums\(dq and SHA256SUM_arch=\(dqsha256sums\(dq
+.P
+These hints redefine DOWNLOAD and MD5SUM, and specify SHA256SUM, as above,
+for the specified arch.
 .
 .
 .SS ADDREQUIRES=\(dqadditional dependencies\(dq
@@ -124,7 +139,8 @@ These hints redefine DOWNLOAD and MD5SUM, as above, for the specified arch.
 This hint should define a list of dependencies, separated by spaces.
 Dependencies in this list will be added to the dependencies defined by the
 REQUIRES= list defined in the .info file. If the .info file specifies %README%,
-you should set this hint to stop slackrepo displaying a warning.
+you should set this hint (possibly as an empty string)
+to stop slackrepo displaying a warning.
 .
 .
 .SS OPTIONS=\(dqOPT1=yes OPT2=no ...\(dq
@@ -191,24 +207,24 @@ This hint is most useful for SlackBuilds that repackage binaries.
 .SS INSTALL=\(dqyesno\(dq
 .P
 This hint temporarily overrides the value of INSTALL given in the configuration
-file or on the command line. Use this hint if you want a specific package to be 
-installed after it has been built (e.g. nvidia-driver). Note that if the control 
+file or on the command line. Use this hint if you want a specific package to be
+installed after it has been built (e.g. nvidia-driver). Note that if the control
 argument --dry-run is specified, this hint will be ignored.
 .
 .
 .SS NUMJOBS=\(dq-j1\(dq
 .P
-This hint temporarily overrides the value of NUMJOBS given in the configuration 
-file or environment. Use this hint if the build process fails when multiple 
+This hint temporarily overrides the value of NUMJOBS given in the configuration
+file or environment. Use this hint if the build process fails when multiple
 'make' jobs are used, so that the build will be executed with MAKEFLAGS='-j1'.
 .
 .
 .SS ANSWERS=\(dqstring\(dq
 .P
-This hint can be specified if the build process wants to read answers to its 
-questions during execution, for example concerning a licence agreement. 
-The string is piped into the SlackBuild's standard input, so it should contain 
-whatever will make the build process happy. Newlines can be specified as \\n, 
+This hint can be specified if the build process wants to read answers to its
+questions during execution, for example concerning a licence agreement.
+The string is piped into the SlackBuild's standard input, so it should contain
+whatever will make the build process happy. Newlines can be specified as \\n,
 for example
 .P
 .RS
@@ -219,51 +235,94 @@ ANSWERS=\(dqok\\nyes\(dq
 .
 .
 .SS CLEANUP=\(dqcommands\(dq
-.P 
+.P
 This hint can be specified if the package needs extra cleanup when it is uninstalled
 (e.g. packages that replace standard Slackware packages or install kernel modules).
-The hint should define an appropriate shell command pipeline. For example, to
-reinstall Slackware packages:
-.P
-.RS
-.EX
-CLEANUP=\(dqecho y | slackpkg -dialog=off -only_new_dotnew=on reinstall tetex tetex-doc\(dq
-.EE
-.RE
-.P
-or to clean up after a kernel module is uninstalled:
+The hint should define an appropriate shell command line.
+to clean up after a kernel module is uninstalled:
 .P
 .RS
 .EX
 CLEANUP=\(dqdepmod -a\(dq
 .EE
 .RE
+.P
+For your convenience, slackrepo provides a command
+.B s_reinstall
+that reinstalls the specified Slackware packages, for example:
+.P
+.RS
+.EX
+CLEANUP=\(dqs_reinstall tetex tetex-doc\(dq
+.EE
+.RE
 .
 .
-.SS SPECIAL=\(dqactions\(dq
-This hint can be specified to perform one or more special actions.
-.B Special actions are not guaranteed to work!
-The following special actions are available:
+.SS PRAGMA=\(dqpragmas\(dq
+This hint can be specified to perform one or more pragmas.
+.B Pragmas are not guaranteed to work!
+The hint name 'PRAGMA' used to be 'SPECIAL', which is still accepted as a synonym.
+The following pragmas are available:
 .P
 .B multilib_ldflags
 .P
 On a multilib host, attempt to patch the SlackBuild to specify LDFLAGS,
-as described in SlackBuilds.org FAQ 18. This is not guaranteed to work!
+as described in SlackBuilds.org FAQ 18.
 .P
 .B download_basename
 .P
 Provide a symlink for source downloads using the URL's basename,
-for the benefit of SlackBuilds that don't expect content-disposition to be respected. 
+for the benefit of SlackBuilds that don't expect content-disposition to be respected.
 .P
-.BR noexport_ARCH " and " noexport_BUILD
+.BR noexport_ARCH " and " noexport_BUILD " and " noexport_TAG
 .P
-Set ARCH or BUILD by patching the SlackBuild instead of exporting it to the environment.
+Set ARCH or BUILD or TAG by patching the SlackBuild instead of exporting it
+to the environment.
+.P
+.B unset_ARCH
+.P
+Unset the value of ARCH, overriding the value given in the configuration file
+or environment.
+Other variables can be specified, for example
+.P
+.RS
+.EX
+PRAGMA=\(dqunset_DISTCC_HOSTS\(dq
+.EE
+.RE
 .P
 .B noremove
 .P
 Do not remove (uninstall) packages before building the item.
 This is particularly useful for gcc, glibc, etc.
 .P
+.B nofakeroot
+.P
+Override building the package as a non-root user with fakeroot.
+Build the package as root, using
+.BR sudo .
+.P
+.B no_make_test
+.P
+Patch the SlackBuild to comment out any 'make test' command.
+.P
+.B stubs-32
+.P
+Temporarily provide
+.I /usr/include/gnu/stubs-32.h
+as described in the memtest86+ README and xen SlackBuild.
+.P
+.B abstar
+.P
+Patch the SlackBuild to use the tar command's
+.I --absolute-names
+control argument. Use this if you get the error message
+.P
+.RS
+.EX
+tar: Directory renamed before its status could be extracted
+.EE
+.RE
 .
 .
 .SH SEE ALSO

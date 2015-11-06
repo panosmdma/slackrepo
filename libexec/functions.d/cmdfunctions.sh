@@ -5,9 +5,11 @@
 # cmdfunctions.sh - command functions for slackrepo
 #   build_command   (see also build_item_packages in buildfunctions.sh)
 #   rebuild_command
-#   update_item
+#   update_command
 #   revert_command
-#   remove_item
+#   remove_command
+#   lint_command
+#   info_command
 #-------------------------------------------------------------------------------
 
 function build_command
@@ -17,119 +19,99 @@ function build_command
 # 0 = build ok, or already up-to-date so not built, or dry run
 # 1 = build failed, or sub-build failed => abort parent, or any other error
 {
-  [ "$OPT_TRACE" = 'y' ] && echo -e ">>>> ${FUNCNAME[*]}\n     $*" >&2
   [ -z "$1" ] && return 1
 
   local itemid="$1"
-  local itemprgnam="${ITEMPRGNAM[$itemid]}"
   local itemdir="${ITEMDIR[$itemid]}"
-  local itemfile="${ITEMFILE[$itemid]}"
 
-  # Quick triage of any cached status:
-  if [ "${STATUS[$itemid]}" = 'ok' ] && [ "$CMD" != 'rebuild' ]; then
-    log_important "$itemid is up-to-date."
-    return 0
-  elif [ "${STATUS[$itemid]}" = 'updated' ]; then
-    STATUS[$itemid]="ok"
-    log_important "$itemid is up-to-date."
-    return 0
-  elif [ "${STATUS[$itemid]}" = 'skipped' ]; then
-    log_itemfinish "$itemid" 'skipped' '' "${STATUSINFO[$itemid]}"
-    return 1
-  elif [ "${STATUS[$itemid]}" = 'unsupported' ]; then
-    log_itemfinish "$itemid" 'unsupported' "on ${SR_ARCH}"
-    return 1
-  elif [ "${STATUS[$itemid]}" = 'failed' ]; then
-    log_error "${itemid} has failed to build."
-    [ -n "${STATUSINFO[$itemid]}" ] && log_always "${STATUSINFO[$itemid]}"
-    return 1
-  elif [ "${STATUS[$itemid]}" = 'aborted' ]; then
-    log_error "Cannot build ${itemid}."
-    [ -n "${STATUSINFO[$itemid]}" ] && log_always "${STATUSINFO[$itemid]}"
-    return 1
-  fi
-
-  # Status is not cached, so work it out
-  log_normal "Calculating dependencies ..."
-  DEPTREE=""
-  NEEDSBUILD=()
-  calculate_deps_and_status "$itemid"
-  if [ "${DIRECTDEPS[$itemid]}" != "" ]; then
-    log_normal "Dependency tree:"
-    [ "$OPT_QUIET" != 'y' ] && echo -n "$DEPTREE"
-  fi
-
-  # Set anything flagged 'updated' back to 'ok' before we go any further
-  for depid in ${FULLDEPS[$itemid]}; do
-    [ "${STATUS[$depid]}" = 'updated' ] && STATUS[$depid]='ok'
-  done
-
-  # Now do almost-but-not-quite-the-same triage on the status
-  if [ "${STATUS[$itemid]}" = 'ok' ] && [ "${#NEEDSBUILD[@]}" = 0 ]; then
-    log_important "$itemid is up-to-date."
-    return 0
-  elif [ "${STATUS[$itemid]}" = 'updated' ]; then
-    STATUS[$itemid]="ok"
-    if [ "${#NEEDSBUILD[@]}" = 0 ]; then
-      log_important "$itemid is up-to-date."
-      return 0
+  TODOLIST=()
+  if [ -z "${STATUS[$itemid]}" ]; then
+    log_normal "Calculating dependencies ... "
+    DEPTREE=""
+    calculate_deps_and_status "$itemid"
+    if [ "${DIRECTDEPS[$itemid]}" = "" ]; then
+      log_done "none."
+    else
+      log_normal "Dependency tree:"
+      echo -n "$DEPTREE"
     fi
-  elif [ "${STATUS[$itemid]}" = 'skipped' ]; then
-    log_itemfinish "$itemid" 'skipped' '' "${STATUSINFO[$itemid]}"
-    return 1
-  elif [ "${STATUS[$itemid]}" = 'unsupported' ]; then
-    log_itemfinish "$itemid" 'unsupported' "on ${SR_ARCH}"
-    return 1
-  elif [ "${STATUS[$itemid]}" = 'failed' ]; then
-    # this can't happen
-    log_error "${itemid} status=${STATUS[$itemid]}"
-    return 1
-  #else
-    # fall through:
-    # ok but something way down the dep tree needs a rebuild => do that
-    # add/update/rebuild => do that
-    # aborted => build what we can, and log errors about the rest
-  fi
-
-  for todo in "${NEEDSBUILD[@]}"; do
     log_normal ""
-    if [ "${STATUS[$todo]}" = 'skipped' ] && [ "$todo" != "$itemid" ]; then
-      log_warning -n "$todo has been skipped."
-      continue
-    elif [ "${STATUS[$todo]}" = 'unsupported' ] && [ "$todo" != "$itemid" ]; then
-      log_warning -n "$todo is unsupported."
-      continue
-    elif [ "${STATUS[$todo]}" = 'failed' ]; then
-      log_error "${todo} has failed to build."
-      [ -n "${STATUSINFO[$todo]}" ] && log_always "${STATUSINFO[$todo]}"
-      continue
+  elif [ "${STATUS[$itemid]}" = 'ok' ] || [ "${STATUS[$itemid]}" = 'updated' ]; then
+    STATUS[$itemid]="ok"
+    for depid in ${FULLDEPS[$itemid]}; do
+      [ "${STATUS[$depid]}" = 'updated' ] && STATUS[$depid]='ok'
+    done
+    if [ "$CMD" = 'rebuild' ]; then
+      found='n'
+      for previously in "${OKLIST[@]}"; do
+        if [ "$previously" = "$itemid" ]; then found='y'; break; fi
+      done
+      if [ "$found" = 'n' ]; then
+        STATUS[$itemid]="rebuild"
+        STATUSINFO[$itemid]="rebuild"
+        TODOLIST=( "$itemid" )
+      fi
     fi
+  fi
 
-    missingdeps=()
-    for dep in ${DIRECTDEPS[$todo]}; do
-      if [ "${STATUS[$dep]}" != 'ok' ] && [ "${STATUS[$dep]}" != 'updated' ]; then
-       missingdeps+=( "$dep" )
+  if [ "${#TODOLIST[@]}" = 0 ]; then
+    # Nothing is going to be built.  Log the final outcome.
+    if [ "${STATUS[$itemid]}" = 'ok' ]; then
+      log_important "$itemid is up-to-date (version ${INFOVERSION[$itemid]})."
+    elif [ "${STATUS[$itemid]}" = 'removed' ]; then
+      log_important "$itemid has been removed."
+    elif [ "${STATUS[$itemid]}" = 'skipped' ]; then
+      log_warning -n "$itemid has been skipped."
+    elif [ "${STATUS[$itemid]}" = 'unsupported' ]; then
+      log_warning -n "$itemid is unsupported on ${SR_ARCH}."
+    elif [ "${STATUS[$itemid]}" = 'failed' ]; then
+      log_error "${itemid} has failed to build."
+      [ -n "${STATUSINFO[$itemid]}" ] && log_normal "${STATUSINFO[$itemid]}"
+    elif [ "${STATUS[$itemid]}" = 'aborted' ]; then
+      log_error "Cannot build ${itemid}."
+      [ -n "${STATUSINFO[$itemid]}" ] && log_normal "${STATUSINFO[$itemid]}"
+    else
+      log_warning "$itemid has unexpected status ${STATUS[$itemid]}"
+    fi
+    log_normal ""
+  else
+    # Process TODOLIST.
+    for todo in "${TODOLIST[@]}"; do
+      if [ "${STATUS[$todo]}" = 'removed' ]; then
+        log_itemfinish "$todo" 'removed' '' "${STATUSINFO[$todo]}"
+      elif [ "${STATUS[$todo]}" = 'skipped' ]; then
+        log_itemfinish "$todo" 'skipped' '' "${STATUSINFO[$todo]}"
+      elif [ "${STATUS[$todo]}" = 'unsupported' ]; then
+        log_itemfinish "$todo" 'unsupported' "on ${SR_ARCH}" ''
+      elif [ "${STATUS[$todo]}" = 'failed' ]; then
+        log_error "${todo} has failed to build."
+        [ -n "${STATUSINFO[$todo]}" ] && log_normal "${STATUSINFO[$todo]}"
+        log_normal ""
+      elif [ "${STATUS[$todo]}" = 'remove' ]; then
+        remove_command "$todo"
+        STATUS[$todo]='removed'
+      else
+        missingdeps=()
+        for dep in ${DIRECTDEPS[$todo]}; do
+          if [ "${STATUS[$dep]}" != 'ok' ] && [ "${STATUS[$dep]}" != 'updated' ]; then
+           missingdeps+=( "$dep" )
+          fi
+        done
+        if [ "${#missingdeps[@]}" = '0' ]; then
+          build_item_packages "$todo"
+        else
+          log_error "Cannot build ${todo}."
+          if [ "${#missingdeps[@]}" = '1' ]; then
+            STATUSINFO[$todo]="Missing dependency: ${missingdeps[0]}"
+          else
+            STATUSINFO[$todo]="Missing dependencies:\n$(printf '  %s\n' "${missingdeps[@]}")"
+          fi
+          STATUS[$todo]='aborted'
+          log_itemfinish "$todo" "aborted" '' "${STATUSINFO[$todo]}"
+        fi
       fi
     done
-    if [ "${#missingdeps[@]}" != '0' ]; then
-      log_error "Cannot build ${todo}."
-      if [ "${#missingdeps[@]}" = '1' ]; then
-        STATUSINFO[$todo]="Missing dependency: ${missingdeps[0]}"
-      else
-        STATUSINFO[$todo]="Missing dependencies:\n$(printf '  %s\n' "${missingdeps[@]}")"
-      fi
-      STATUS[$todo]='aborted'
-      log_itemfinish "$todo" "aborted" '' "${STATUSINFO[$todo]}"
-      continue
-    fi
-
-    buildopt=''
-    [ "$OPT_DRY_RUN" = 'y' ] && buildopt=' [dry run]'
-    [ "$OPT_INSTALL" = 'y' ] && buildopt=' [install]'
-    log_itemstart "$todo" "Starting $todo (${STATUSINFO[$todo]})$buildopt"
-    build_item_packages "$todo"
-
-  done
+  fi
 
   return 0
 }
@@ -157,7 +139,7 @@ function update_command
 {
   local itemid="${1:-$ITEMID}"
   local itemdir="${ITEMDIR[$itemid]}"
-  if [ -d "$SR_SBREPO"/"$itemdir"/ ]; then
+  if [ -n "$itemdir" ] && [ -d "$SR_SBREPO"/"$itemdir"/ ]; then
     build_command "$itemid"
     return $?
   else
@@ -177,8 +159,6 @@ function revert_command
 # 1 = backups not configured
 # Problems: (1) messes up build number, (2) messes up deps & dependers
 {
-  [ "$OPT_TRACE" = 'y' ] && echo -e ">>>> ${FUNCNAME[*]}\n     $*" >&2
-
   local itemid="${1:-$ITEMID}"
   local itemdir="${ITEMDIR[$itemid]}"
 
@@ -194,6 +174,8 @@ function revert_command
   archsourcebackupdir="${allsourcebackupdir}_${SR_ARCH}"
   allsourcebackuptempdir="$backuptempdir"/source
   archsourcebackuptempdir="${allsourcebackuptempdir}_${SR_ARCH}"
+
+  #### IMPORTANT #### repopulate 'packages' table after revert
 
   log_itemstart "$itemid"
 
@@ -224,7 +206,7 @@ function revert_command
         mybuildtime="${b_built}"
       else
         deprevdata=( $(db_get_rev "${b_depid}") )
-        if [ "${deprevdata[2]}" -gt "$mybuildtime" ]; then
+        if [ "${deprevdata[2]:-0}" -gt "$mybuildtime" ]; then
           log_warning "${b_depid} may need to be reverted"
         fi
       fi
@@ -253,6 +235,8 @@ function revert_command
 
   if [ "$OPT_DRY_RUN" != 'y' ]; then
     # Actually perform the reversion!
+    # With big packages this might take a while, so log a message
+    log_normal "Reverting $itemid ... "
     # move the current package to a temporary backup directory
     if [ -d "$packagedir" ]; then
       mv "$packagedir" "$backuptempdir"
@@ -288,7 +272,7 @@ function revert_command
     while read revinfo; do
       db_set_rev $revinfo
     done < "$backuprevfile"
-    rm "$backuprevfile"
+    rm -f "$backuprevfile"
     # revert the previous package
     # (we already know that this exists, so no need for a test)
     mv "$backupdir" "$packagedir"
@@ -297,6 +281,7 @@ function revert_command
       mv "$backuptempdir" "$backupdir"
     fi
     # Finished!
+    log_done
   fi
 
   # Log what happened, or what would have happened:
@@ -340,22 +325,30 @@ function remove_command
 # $1 = itemid
 # Return status: always 0
 {
-  [ "$OPT_TRACE" = 'y' ] && echo -e ">>>> ${FUNCNAME[*]}\n     $*" >&2
-
   local itemid="${1:-$ITEMID}"
   local itemdir="${ITEMDIR[$itemid]}"
   local packagedir="$SR_PKGREPO"/"$itemdir"
   local allsourcedir="$SR_SRCREPO"/"$itemdir"
   local archsourcedir="$allsourcedir"/"$SR_ARCH"
 
-  log_itemstart "$itemid"
-
-  # Preliminary warnings and comments:
-  # Log a warning about any dependers
-  dependers=$(db_get_dependers "$itemid")
-  for depender in $dependers; do
-    log_warning "$depender may need to be removed or rebuilt"
-  done
+  # Preliminary messages:
+  if [ "$itemid" = "$ITEMID" ]; then
+    log_itemstart "$itemid"
+    if [ "${STATUS[$itemid]}" = 'removed' ] || [ -z "$itemdir" ] || [ ! -d "$SR_SBREPO"/"$itemdir"/ ]; then
+      log_important "$itemid has been removed."
+      log_normal ""
+      return 0
+    fi
+    # Log a warning about any dependers, unless this is happening within another item
+    dependers=$(db_get_dependers "$itemid")
+    for depender in $dependers; do
+      log_warning "$depender may need to be removed or rebuilt"
+    done
+  else
+    removeopt=''
+    [ "$OPT_DRY_RUN" = 'y' ] && removeopt=' [dry run]'
+    log_itemstart "$itemid" "Removing $itemid$removeopt"
+  fi
   # Log a comment if the packages don't exist
   packagelist=( "$packagedir"/*.t?z )
   if [ ! -f "${packagelist[0]}" ]; then
@@ -377,6 +370,7 @@ function remove_command
     backupdir="$SR_PKGBACKUP"/"$itemdir"
     if [ -d "$packagedir" ]; then
       if [ "$OPT_DRY_RUN" != 'y' ]; then
+        [ -d "$backupdir" ] && rm -rf "$backupdir"
         # move the whole package directory to the backup directory
         mkdir -p "$(dirname "$backupdir")"
         mv "$packagedir" "$backupdir"
@@ -445,7 +439,7 @@ function remove_command
       find "$archsourcedir" -type f -maxdepth 1 -print | while read srcpath; do
         srcfile="$(basename "$srcpath")"
         if [ "$OPT_DRY_RUN" != 'y' ]; then
-          rm "$srcpath"
+          rm -f "$srcpath"
           log_normal "Source file $srcfile has been removed"
         else
           log_normal "Source file $srcfile would be removed"
@@ -455,7 +449,7 @@ function remove_command
       find "$allsourcedir" -type f -maxdepth 1 -print | while read srcpath; do
         srcfile="$(basename "$srcpath")"
         if [ "$OPT_DRY_RUN" != 'y' ]; then
-          rm "$srcpath"
+          rm -f "$srcpath"
           log_normal "Source file $srcfile has been removed"
         else
           log_normal "Source file $srcfile would be removed"
@@ -465,20 +459,20 @@ function remove_command
 
   fi
 
-  # Remove the package directory and any empty parent directories
-  # (don't bother with the source directory)
   if  [ "$OPT_DRY_RUN" != 'y' ]; then
+    # Remove the package directory and any empty parent directories
+    # (don't bother with the source directory)
     rm -rf "${SR_PKGREPO:?NotSetSR_PKGREPO}/${itemdir}"
     up="$(dirname "$itemdir")"
     [ "$up" != '.' ] && rmdir --parents --ignore-fail-on-non-empty "${SR_PKGREPO}/${up}"
+    # Delete the revision and package name data
+    db_del_rev "$itemid"
+    db_del_itemid_pkgnam "$itemid"
   fi
-
-  # Delete the revision data
-  db_del_rev "$itemid"
 
   # Changelog, and exit with a smile
   if [ "$OPT_DRY_RUN" != 'y' ]; then
-    changelog "$itemid" "Removed" "" "${pkglist[@]}"
+    changelog "$itemid" "Removed" "" "${packagelist[@]}"
     log_itemfinish "$itemid" 'ok' "Removed"
   else
     log_itemfinish "$itemid" 'ok' "Removed [dry run]"
@@ -487,4 +481,179 @@ function remove_command
 
   return 0
 
+}
+
+#-------------------------------------------------------------------------------
+
+function lint_command
+# Test an item without building or installing it
+# $1 = itemid
+# Return status: always 0
+{
+  local itemid="$1"
+  local itemdir="${ITEMDIR[$itemid]}"
+
+  log_itemstart "$itemid"
+  parse_info_and_hints "$itemid"
+  if [ $? != 0 ]; then
+    if [ "${STATUS[$itemid]}" = "unsupported" ]; then
+      log_itemfinish "$itemid" "unsupported" "on ${SR_ARCH}"
+    elif [ "${STATUS[$itemid]}" = "skipped" ]; then
+      log_itemfinish "$itemid" "skipped" ""
+    else
+      log_itemfinish "$itemid" "${STATUS[$itemid]}" ''
+    fi
+    return 0
+  fi
+
+  test_slackbuild "$itemid"
+  tsbstat=$?
+
+  tdlstat=0
+  verify_src "$itemid" "log_important"
+  case $? in
+    0)  # already got source, and it's good
+        test_download "$itemid"
+        tdlstat=$?
+        ;;
+    1|2|3)
+        # already got source but it's bad, or not got source => get it and try again
+        download_src "$itemid"
+        if [ "$?" = 0 ]; then
+          verify_src "$itemid" "log_warning"
+          [ $? != 0 ] && tdlstat=1
+        else
+          tdlstat=1
+        fi
+        ;;
+    4)
+        # version mismatch: we don't know the md5sums for the old source, and
+        # we don't want to replace the old source with the new source, so we
+        # can't do the test.
+        log_important -a "Source is out-of-date."
+        ;;
+    5|6)
+        # unsupported/untested/nodownload (actually, unsupported/untested was
+        # filtered out earlier, so this is really just nodownload)
+        :
+        ;;
+  esac
+
+  tpkstat=0
+  pstat=''
+  for pkgnam in $(db_get_itemid_pkgnams "$itemid"); do
+    pkgpathlist=( "${SR_PKGREPO}"/"$itemdir"/"$pkgnam"-*-*-*.t?z )
+    for pkgpath in "${pkgpathlist[@]}"; do
+      if [ -f "$pkgpath" ]; then
+        test_package -n "$itemid" "$pkgpath"
+        pstat=$?
+        [ $pstat -gt $tpkstat ] && tpkstat=$pstat
+      fi
+    done
+  done
+  [ -z "$pstat" ] && log_important -a "No packages found."
+
+  log_normal -a ""
+  if [ "$tsbstat" = 0 ] && [ "$tdlstat" = 0 ] && [ "$tpkstat" = 0 ]; then
+    log_itemfinish "$itemid" "ok" "lint OK"
+  elif [ "$tsbstat" -le 1 ] && [ "$tdlstat" -le 1 ] && [ "$tpkstat" -le 1 ]; then
+    log_itemfinish "$itemid" "warning" "lint completed with warnings"
+  else
+    log_itemfinish "$itemid" "failed" "lint"
+  fi
+
+  return 0
+}
+
+#-------------------------------------------------------------------------------
+
+function info_command
+# Print version, configuration and debugging information on standard output
+# This is called without initialising the repo, so don't use log_xxxx
+{
+  echo ""
+  print_version
+  echo ""
+
+  # Show the system info
+  echo "$(hostname)"
+  echo "  OS: ${SYS_OSNAME}${SYS_OSVER}"
+  echo "  kernel: ${SYS_KERNEL}"
+  echo "  arch: ${SYS_ARCH}"
+  [ "$SYS_MULTILIB" = 'y' ] && echo "  multilib: yes"
+  echo "  nproc: ${SYS_NPROC}"
+  echo "  total MHz: ${SYS_MHz}"
+  [ "$SYS_OVERLAYFS" = 'y' ] && echo "  overlayfs: yes"
+  [ "$EUID" != 0 ] && echo "  username: $USER"
+  echo ""
+
+  # Show which config files exist
+  echo "Configuration files:"
+  for configfile in ~/.slackreporc ~/.genreprc /etc/slackrepo/slackrepo_"${OPT_REPO}".conf; do
+    if [ -f "$configfile" ]; then
+      echo "  $configfile: yes"
+    else
+      echo "  $configfile: no"
+    fi
+  done
+  echo ""
+
+  # Show the options
+  echo "Configuration options and variables:"
+  echo "  --repo=$OPT_REPO"
+  if [ "$OPT_VERY_VERBOSE" = 'y' ]; then
+    echo "  --very-verbose"
+  elif [ "$OPT_VERBOSE" = 'y' ]; then
+    echo "  --verbose"
+  fi
+  [      "$OPT_DRY_RUN" = 'y' ] && echo "  --dry-run"
+  [      "$OPT_INSTALL" = 'y' ] && echo "  --install"
+  [         "$OPT_LINT" = 'y' ] && echo "  --lint"
+  [     "$OPT_KEEP_TMP" = 'y' ] && echo "  --keep-tmp"
+  [       "$OPT_CHROOT" = 'y' ] && echo "  --chroot"
+  [    "$OPT_COLOR" != 'auto' ] && echo "  --color=$OPT_COLOR"
+  [        "$OPT_NICE" != '5' ] && echo "  --nice=$OPT_NICE"
+
+  # Show the variables
+  for name in $varnames; do
+    srvar="SR_$name"
+    echo "  $name=\"${!srvar}\""
+  done
+  if [ "$SR_USE_GENREPOS" = 1 ]; then
+    for name in $genrepnames; do
+      srvar="SR_$name"
+      [ -n "${!srvar}" ] && echo "  $name=\"${!srvar}\""
+    done
+  else
+    echo "  USE_GENREPOS=\"$SR_USE_GENREPOS\""
+  fi
+  echo ""
+
+  # Show the repository info
+  if [ -d "$SR_SBREPO" ]; then
+    cd "$SR_SBREPO"
+    if [ -d ".git" ]; then
+      [ -n "$(git status -s .)" ] && dirty=' (DIRTY)'
+      echo "git repo:   $SR_SBREPO"
+      echo "  branch:   $(git rev-parse --abbrev-ref HEAD)"
+      echo "  date:     $(date --date=@$(git log -n 1 --format=%ct))"
+      echo "  revision: $(git rev-parse HEAD)$dirty"
+      echo "  title:    $(git log -n 1 --format=%s)"
+    else
+      echo "SlackBuild repo: $SR_SBREPO (not git)"
+    fi
+  else
+    echo "Repository $SR_SBREPO does not exist."
+  fi
+  echo ""
+
+  # Show significant environment variables. This is not a comprehensive list (see
+  # https://www.gnu.org/software/make/manual/html_node/Implicit-Variables.html)
+  # and upstream builds don't always use them properly.
+  for name in AR AS CC CFLAGS CXX CXXFLAGS CPP CPPFLAGS LD LDFLAGS DISTCC_HOSTS; do
+    [ -n "${!name}" ] && echo "  $name=\"${!name}\""
+  done
+  echo ""
+
+  return 0
 }

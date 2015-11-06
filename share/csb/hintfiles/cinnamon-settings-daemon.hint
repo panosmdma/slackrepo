@@ -1,2 +1,0 @@
-ADDREQUIRES="cinnamon-desktop colord libgnomekbd pulseaudio"
-SPECIAL="download_basename"

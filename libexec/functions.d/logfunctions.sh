@@ -10,9 +10,9 @@
 #-------------------------------------------------------------------------------
 # logfunctions.sh - logging functions for slackrepo
 # Progress:
-#   log_verbose
 #   log_normal
-#   log_always
+#   log_verbose
+#   log_info
 #   log_important
 #   log_warning
 #   log_error
@@ -28,69 +28,121 @@
 #   format_left_right
 #-------------------------------------------------------------------------------
 
-#-------------------------------------------------------------------------------
-# PROGRESS
-#-------------------------------------------------------------------------------
+# Globals:
+PADBLANK="                                                                                "
+PADLINE="--------------------------------------------------------------------------------"
+DBLLINE="================================================================================"
+LINEWIDTH=80
+LINEUSABLE=$(( LINEWIDTH - 9 ))    # 9 is the length of <space>HH:MM:SS
 
-function log_verbose
-# Log a message to standard output if OPT_VERBOSE is set.
-# Log a message to ITEMLOG if '-a' is specified.
-# $* = message
-# Return status: always 0
-{
-  A='n'
-  [ "$1" = '-a' ] && { A='y'; shift; }
-  [ "$OPT_VERBOSE" = 'y' ] && echo -e "$*"
-  [ "$A" = 'y' ] && echo -e "$*" >> "$ITEMLOG"
-  return 0
-}
-
+#-------------------------------------------------------------------------------
+# PROGRESS MESSAGES
 #-------------------------------------------------------------------------------
 
 function log_normal
-# Log a message to standard output unless OPT_QUIET is set.
+# Log a message to standard output, with an optional second message to the right.
+# Typically the second message will be the current time, or a time estimate.
 # Log a message to ITEMLOG if '-a' is specified.
 # If the message ends with "... " (note the space), no newline is written.
-# $* = message
+# Usage: log_normal [-a] messagestring [leftmessagestring]
 # Return status: always 0
 {
   A='n'
   [ "$1" = '-a' ] && { A='y'; shift; }
-  nonewline=''
-  eval lastarg=\"\${$#}\"
-  [ "${lastarg: -4:4}" = '... ' ] && { nonewline='-n'; NEEDNEWLINE='y'; }
-  [ "$OPT_QUIET" != 'y' ] && echo -e $nonewline "$*"
-  [ "$A" = 'y' ] && echo -e $nonewline "$*" >> "$ITEMLOG"
+  if [ -z "$2" ]; then
+    nonewline=''
+    [ "${1: -4:4}" = '... ' ] && nonewline='-n'
+    echo -e $nonewline "${NL}${1}"
+    [ "$A" = 'y' ] && [ -n "$ITEMLOG" ] && echo -e "${1}" >> "$ITEMLOG"
+    if [ "$nonewline" = '-n' ]; then
+      NL='\n'
+    else
+      NL=''
+    fi
+  else
+    if [ $(( ${#1} + ${#2} )) -lt "$LINEWIDTH" ]; then
+      read llen plen rlen < <(format_left_right "$1" "$2")
+      echo -e "${NL}${1:0:$llen}${PADBLANK:0:$plen}${2:0:$rlen}"
+      [ "$A" = 'y' ] && [ -n "$ITEMLOG" ] && echo -e "${NL}${1}${PADBLANK:0:$plen}${2}" >> "$ITEMLOG"
+    else
+      echo -e "${NL}${1}\n${PADBLANK:0:$(( LINEWIDTH - ${#2} ))}${2}"
+      [ "$A" = 'y' ] && [ -n "$ITEMLOG" ] && echo -e "${NL}${1}\n${PADBLANK:0:$(( LINEWIDTH - ${#2} ))}${2}" >> "$ITEMLOG"
+    fi
+    NL=''
+  fi
   return 0
 }
 
 #-------------------------------------------------------------------------------
 
-function log_always
-# Log a message to standard output.
+function log_verbose
+# Log an informational message to standard output if OPT_VERBOSE is set.
 # Log a message to ITEMLOG if '-a' is specified.
-# $* = message
+# Usage: log_verbose [-a] messagestring
 # Return status: always 0
 {
   A='n'
   [ "$1" = '-a' ] && { A='y'; shift; }
-  echo -e "$*"
-  [ "$A" = 'y' ] && echo -e "$*" >> "$ITEMLOG"
+  [ "$OPT_VERBOSE" = 'y' ] && echo -e "${colour_info}${1}${colour_normal}"
+  [ "$A" = 'y' ] && [ -n "$ITEMLOG" ] && echo -e "${1}" >> "$ITEMLOG"
+  return 0
+}
+
+#-------------------------------------------------------------------------------
+
+function log_info
+# Log an informational message to standard output.
+# If '-t' is specified, truncate it at 3000 chars unless OPT_VERBOSE is set.
+# Log a message to ITEMLOG if '-a' is specified.
+# Usage: log_info [-a] messagestring
+# Return status: always 0
+{
+  T='n'
+  A='n'
+  while [ $# != 0 ]; do
+    case "$1" in
+    '-t') T='y';  shift; continue ;;
+    '-a') A='y'; shift; continue ;;
+    *)    break ;;
+    esac
+  done
+  infostuff="$1"
+  [ -z "$infostuff" ] && return 0
+  [ "$A" = 'y' ] && [ -n "$ITEMLOG" ] && echo -e "${1}" >> "$ITEMLOG"
+  if [ "$OPT_VERBOSE" != 'y' ]; then
+    [ "$T" = 'y' ] && [ ${#infostuff} -gt 3000 ] && infostuff="${infostuff:0:3000}\n[...]"
+  fi
+  echo -e "${NL}${colour_info}${infostuff}${colour_normal}"
+  NL=''
   return 0
 }
 
 #-------------------------------------------------------------------------------
 
 function log_important
-# Log a message to standard output in white highlight.
+# Log a message to standard output in white highlight, with an optional second
+# message to the right.
+# Typically the second message will be the current time, or a time estimate.
 # Log a message to ITEMLOG if '-a' is specified.
-# $* = message
+# Usage: log_important [-a] messagestring [leftmessagestring]
 # Return status: always 0
 {
   A='n'
   [ "$1" = '-a' ] && { A='y'; shift; }
-  echo -e "${tputwhite}$*${tputnormal}"
-  [ "$A" = 'y' ] && echo -e "$*" >> "$ITEMLOG"
+  if [ -z "${2}" ]; then
+    echo -e "${NL}${colour_important}${1}${colour_normal}"
+    [ "$A" = 'y' ] && [ -n "$ITEMLOG" ] && echo -e "${1}" >> "$ITEMLOG"
+  else
+    if [ $(( ${#1} + ${#2} )) -lt "$LINEWIDTH" ]; then
+      read llen plen rlen < <(format_left_right "$1" "$2")
+      echo -e "${NL}${colour_important}${1:0:$llen}${colour_normal}${PADBLANK:0:$plen}${2:0:$rlen}"
+      [ "$A" = 'y' ] && [ -n "$ITEMLOG" ] && echo -e "${1}${PADBLANK:0:$plen}${2}" >> "$ITEMLOG"
+    else
+      echo -e "${NL}${colour_important}${1}${colour_normal}\n${PADBLANK:0:$(( LINEWIDTH - ${#2} ))}${2}"
+      [ "$A" = 'y' ] && [ -n "$ITEMLOG" ] && echo -e "${1}\n${PADBLANK:0:$(( LINEWIDTH - ${#2} ))}${2}" >> "$ITEMLOG"
+    fi
+  fi
+  NL=''
   return 0
 }
 
@@ -101,7 +153,7 @@ function log_warning
 # Log a message to ITEMLOG if '-a' is specified.
 # Message is prefixed with 'WARNING' (unless '-n' is specified).
 # Message is remembered in the array WARNINGLIST (unless '-n' is specified).
-# $* = message
+# Usage: log_warning [-a] [-n] messagestring
 # Return status: always 0
 {
   W='WARNING: '
@@ -113,19 +165,22 @@ function log_warning
     *)    break ;;
     esac
   done
-  echo -e "${tputyellow}${W}$*${tputnormal}"
-  [ "$A" = 'y' ] && echo -e "${W}$*" >> "$ITEMLOG"
-  [ -n "$W" ] && WARNINGLIST+=( "$*" )
+  echo -e "${NL}${colour_warning}${W}${1}${colour_normal}"
+  [ "$A" = 'y' ] && [ -n "$ITEMLOG" ] && echo -e "${W}${1}" >> "$ITEMLOG"
+  NL=''
+  [ -n "$W" ] && WARNINGLIST+=( "${1}" )
   return 0
 }
 
 #-------------------------------------------------------------------------------
 
 function log_error
-# Log a message to standard output in red highlight.
+# Log a message to standard output in red highlight, with an optional second
+# message to the right.
+# Typically the second message will be the current time, or a time estimate.
 # Log a message to ITEMLOG if '-a' is specified.
-# Message is prefixed with 'ERROR' (unless '-n' is specified).
-# $* = message
+# Message is prefixed with 'ERROR: ' (unless '-n' is specified).
+# Usage: log_error [-a] [-n] messagestring
 # Return status: always 0
 {
   E='ERROR: '
@@ -137,41 +192,50 @@ function log_error
     *)    break ;;
     esac
   done
-  echo -e "${tputred}${E}$*${tputnormal}"
-  [ "$A" = 'y' ] && echo -e "${E}$*" >> "$ITEMLOG"
+  if [ -z "${2}" ]; then
+    echo -e "${NL}${colour_error}${E}${1}${colour_normal}"
+    [ "$A" = 'y' ] && [ -n "$ITEMLOG" ] && echo -e "${E}${1}" >> "$ITEMLOG"
+  else
+    if [ $(( ${#1} + ${#2} )) -lt "$LINEWIDTH" ]; then
+      read llen plen rlen < <(format_left_right "$1" "$2")
+      echo -e "${NL}${colour_error}${1:0:$llen}${colour_normal}${PADBLANK:0:$plen}${2:0:$rlen}"
+      [ "$A" = 'y' ] && [ -n "$ITEMLOG" ] && echo -e "${1}${PADBLANK:0:$plen}${2}" >> "$ITEMLOG"
+    else
+      echo -e "${NL}${colour_error}${1}${colour_normal}\n${PADBLANK:0:$(( LINEWIDTH - ${#2} ))}${2}"
+      [ "$A" = 'y' ] && [ -n "$ITEMLOG" ] && echo -e "${1}\n${PADBLANK:0:$(( LINEWIDTH - ${#2} ))}${2}" >> "$ITEMLOG"
+    fi
+  fi
+  NL=''
   return 0
 }
 
 #-------------------------------------------------------------------------------
 
 function log_done
-# Log the message "done" to standard output.
-# Log the message "done" to ITEMLOG if '-a' is specified.
+# Log the message "done." or a similar message to standard output (but not ITEMLOG).
+# Usage: log_done [message]
+# $1 = optional message to substitute for "done."
 # Return status: always 0
 {
-  A='n'
-  [ "$1" = '-a' ] && { A='y'; shift; }
-  echo "done."
-  [ "$A" = 'y' ] && echo "done." >> "$ITEMLOG"
+  [ -n "${NL}" ] && echo "${1:-done.}" && NL=''
   return 0
 }
 
 #-------------------------------------------------------------------------------
-# START AND FINISH
+# START AND FINISH MESSAGES
 # note that these functions set various globals etc
 #-------------------------------------------------------------------------------
 
 function log_start
 # Log the start of a top level item on standard output.
-# $* = message
+# The current time is shown on the right (possibly truncating the message).
+# Usage: log_start messagestring
 # Return status: always 0
 {
-  msg="${*}                                                                        "
-  line="==============================================================================="
-  echo ""
-  echo "$line"
-  echo "${msg:0:70} $(date +%T)"
-  echo "$line"
+  msg="${1}                                                                         "
+  echo "${DBLLINE:0:$LINEWIDTH}"
+  echo "${msg:0:$LINEUSABLE} $(date +%T)"
+  echo "${DBLLINE:0:$LINEWIDTH}"
   echo ""
   return 0
 }
@@ -183,29 +247,25 @@ function log_itemstart
 # This is where we start logging to ITEMLOG, which is set here, using $itemid set by our caller.
 # (At any time only one ITEMLOG can be active.)
 # If the optional message is not specified, don't print anything - just setup the itemlog.
-# $1 = itemid
-# $2 = message (optional)
+# Usage: log_itemstart itemid [messagestring]
 # Return status: always 0
 {
   local itemid="$1"
   local message="$2"
-  local itemprgnam="${ITEMPRGNAM[$itemid]}"
-  local itemdir="${ITEMDIR[$itemid]}"
 
-  if [ -n "$itemid" ]; then
-    if [ -n "$message" ]; then
-      [ "$OPT_VERY_VERBOSE" = 'y' ] && echo ""
-      padline="----------------------------------------------------------------------"
-      if [ ${#message} -ge ${#padline} ]; then
-        echo -e "${padline} $(date +%T)\n${tputwhite}${message}${tputnormal}"
-      else
-        padlen=$(( ${#padline} - ${#message} - 1 ))
-        echo "${tputwhite}${message}${tputnormal} ${padline:0:$padlen} $(date +%T)"
-      fi
+  if [ -n "$message" ]; then
+    # Impose a minimum 5 chars of padding
+    if [ $(( ${#message} + 5 )) -gt "$LINEUSABLE" ]; then
+      echo -e "${PADLINE:0:$LINEUSABLE} $(date +%T)\n${colour_important}${message}${colour_normal}"
+    else
+      padlen=$(( LINEUSABLE - ${#message} - 1 ))
+      echo "${colour_important}${message}${colour_normal} ${PADLINE:0:$padlen} $(date +%T)"
     fi
-    ITEMLOGDIR="$SR_LOGDIR"/"$itemdir"
+  fi
+  if [ -n "$itemid" ] && [ -n "${ITEMDIR[$itemid]}" ]; then
+    ITEMLOGDIR="$SR_LOGDIR"/"${ITEMDIR[$itemid]}"
     mkdir -p "$ITEMLOGDIR"
-    ITEMLOG="$ITEMLOGDIR"/"$itemprgnam".log
+    ITEMLOG="$ITEMLOGDIR"/"$CMD".log
     if [ -f "$ITEMLOG" ]; then
       oldlog="${ITEMLOG%.log}.1.log"
       mv "$ITEMLOG" "$oldlog"
@@ -221,8 +281,9 @@ function log_itemstart
 
 function log_itemfinish
 # Log the finish of an item to standard output, and to ITEMLOG
+# Usage: log_itemfinish itemid result [messagestring] [additionalmessagestring]
 # $1 = itemid
-# $2 = result ('ok', 'skipped', 'unsupported', 'failed', or 'aborted')
+# $2 = result ('ok', 'warning', 'skipped', 'unsupported', 'failed', 'aborted', or 'bad')
 # $3 = message (optional)
 # $4 = additional message for display on the next line (optional)
 # Return status: always 0
@@ -230,9 +291,17 @@ function log_itemfinish
   local itemid="$1"
   local result="${2^^}"
   local message="$itemid"
-  [ "$result" = 'UNSUPPORTED' ] && message="$message is"
-  [ "$result" != 'OK' ] && message="$message $result"
+  case "$result" in
+    'OK') message="$itemid" ;;
+    'WARNING') message="$itemid" ;;
+    'SKIPPED') message="$itemid SKIPPED" ;;
+    'UNSUPPORTED') message="$itemid is UNSUPPORTED" ;;
+    'FAILED') message="$itemid FAILED" ;;
+    'ABORTED') message="$itemid ABORTED" ;;
+    'BAD') message="BAD ARGUMENT '$itemid'" ;;
+  esac
   [ -n "$3" ] && message="$message $3"
+
   addmessage=""
   [ -n "$4" ] && addmessage=$'\n'"$4"
   if [ -z "$ITEMLOG" ]; then
@@ -242,30 +311,29 @@ function log_itemfinish
   fi
   case "$result" in
     'OK')
-      echo -e "${tputgreen}:-) $message (-:${addmessage}${tputnormal}"
-      [ -n "$ITEMLOG" ] && echo -e ":-) $message (-:${addmessage}" >> "$ITEMLOG"
+      echo -e "${colour_success}:-) $message (-:${addmessage}${colour_normal}\n"
+      [ -n "$ITEMLOG" ] && echo -e ":-) $message (-:${addmessage}\n" >> "$ITEMLOG"
       ;;
-    'SKIPPED')
-      echo -e "${tputyellow}:-/ $message /-:${addmessage}${tputnormal}"
-      [ -n "$ITEMLOG" ] && echo -e ":-/ $message /-:${addmessage}" >> "$ITEMLOG"
+    'WARNING' | 'SKIPPED' | 'UNSUPPORTED')
+      echo -e "${colour_warning}:-/ $message /-:${addmessage}${colour_normal}\n"
+      [ -n "$ITEMLOG" ] && echo -e ":-/ $message /-:${addmessage}\n" >> "$ITEMLOG"
       ;;
-    'UNSUPPORTED')
-      echo -e "${tputyellow}:-/ $message /-:${addmessage}${tputnormal}"
-      [ -n "$ITEMLOG" ] && echo -e ":-/ $message /-:${addmessage}" >> "$ITEMLOG"
-      ;;
-    'FAILED' | 'ABORTED')
-      echo -e "${tputred}:-( $message )-:${addmessage}${tputnormal}"
-      [ -n "$ITEMLOG" ] && echo -e ":-( $message )-:${addmessage}" >> "$ITEMLOG"
+    'FAILED' | 'ABORTED' | 'BAD')
+      echo -e "${colour_error}:-( $message )-:${addmessage}${colour_normal}\n"
+      [ -n "$ITEMLOG" ] && echo -e ":-( $message )-:${addmessage}\n" >> "$ITEMLOG"
       ;;
   esac
-  eval "${result}LIST+=( ${itemid} )"
-  db_set_buildresults "$itemid" "$2"
+  # WARNINGLIST is populated by grepping the log, so don't set it here
+  [ "$result" != 'WARNING' ] && eval "${result}LIST+=( ${itemid} )"
+  if [ "$CMD" = 'build' ] || [ "$CMD" = 'update' ] || [ "$CMD" = 'rebuild' ]; then
+    db_set_buildresults "$itemid" "$2"
+  fi
   unset ITEMLOG
   return 0
 }
 
 #-------------------------------------------------------------------------------
-# UTILITIES
+# UTILITY FUNCTIONS
 #-------------------------------------------------------------------------------
 
 function init_colour
@@ -274,28 +342,44 @@ function init_colour
 # 0 = imax
 # 1 = 405 lines
 {
-  tputbold=''
-  tputred=''
-  tputgreen=''
-  tputyellow=''
-  tputwhite=''
-  tputnormal=''
   DOCOLOUR='n'
   [ "$OPT_COLOR" = 'always'       ] && DOCOLOUR='y'
   [ "$OPT_COLOR" = 'auto' -a -t 1 ] && DOCOLOUR='y'
-  [ "$DOCOLOUR" = 'n' ] && return 1
-  tputbold="$(tput bold)"
-  [ $? != 0 ] && { DOCOLOUR='n'; return 1; }
-  tputred="$tputbold$(tput setaf 1)"
-  [ $? != 0 ] && { DOCOLOUR='n'; return 1; }
-  tputgreen="$tputbold$(tput setaf 2)"
-  [ $? != 0 ] && { DOCOLOUR='n'; return 1; }
-  tputyellow="$tputbold$(tput setaf 3)"
-  [ $? != 0 ] && { DOCOLOUR='n'; return 1; }
-  tputwhite="$tputbold$(tput setaf 7)"
-  [ $? != 0 ] && { DOCOLOUR='n'; return 1; }
-  tputnormal="$(tput sgr0)"
-  [ $? != 0 ] && { DOCOLOUR='n'; return 1; }
+  if [ "$DOCOLOUR" = 'n' ]; then
+    colour_error=""
+    colour_warning=""
+    colour_success=""
+    colour_important=""
+    colour_normal=""
+    colour_info=""
+    colour_ok=""
+    colour_build=""
+    colour_skip=""
+    colour_fail=""
+    colour_updated=""
+    return 1
+  fi
+  # we used to use tput, but apparently everything from ls to gcc has abandoned
+  # the wisdom of the old ones and just assumes ansi :-/
+  csi=$'\x1b['
+  colour_error="${csi}1;31m"
+  colour_warning="${csi}1;35m"
+  colour_success="${csi}1;32m"
+  colour_important="${csi}1m"
+  colour_normal="${csi}0m"
+  colour_info="${csi}22;36m"
+  colour_ok="${csi}0m"
+  colour_build="${csi}22;32m"
+  colour_skip="${csi}22;35m"
+  colour_fail="${csi}22;31m"
+  colour_updated="${csi}22;36m"
+  for c in $(echo "${SLACKREPO_COLORS}" | sed 's/:/ /g'); do
+    cname="${c/=*/}"
+    cvalue="${c/*=/}"
+    eval "colour_${cname}=\"${csi}${cvalue}m\""
+  done
+  [ -z "$GCC_COLORS" ] && export GCC_COLORS="error=01;31:warning=01;35:note=01;36:caret=01;32:locus=01:quote=01"
+  echo -n "${colour_normal}"
   return 0
 }
 
@@ -354,39 +438,25 @@ function errorscan_itemlog
 #-------------------------------------------------------------------------------
 
 function format_left_right
-# Format a two-part message, with the first part right justified, and the second
-# part left justified.  The formatted string is printed on standard output.
-# $1 = first part
-# $2 = second part (optional)
+# Calculate, and print on standard output, the string lengths necessary to
+# format $1 on the left, padding in the middle, and $2 on the right.
+# $1 = left hand message
+# $2 = right hand message
 # Return status: always 0
 {
-  if [ -z "$2" ]; then
-    # Don't muck about, just print $1:
-    echo "$1"
-    return 0
-  fi
-
-  lmsg="${1}"
-  rmsg="${2}"
-  pad="                                                                                "
-  # Line width is hardcoded here:
-  width=79
-  # Minimum width of left part:
-  lmin=1
-  # Minimum amount of padding:
-  pmin=1
-
-  rlen=${#rmsg}
-  llen=${#lmsg}
-  plen=$pmin
-
+  local lmsg="${1}"
+  local rmsg="${2}"
+  local lmin=1  # minimum width of left part
+  local pmin=1  # minimum amount of padding
+  local llen=${#lmsg}
+  local plen=$pmin
+  local rlen=${#rmsg}
   # If rlen is too long, reduce it:
-  [ "$rlen" -gt $(( width - lmin - pmin )) ] && rlen=$(( width - lmin - pmin ))
+  [ "$rlen" -gt $(( LINEWIDTH - lmin - pmin )) ] && rlen=$(( LINEWIDTH - lmin - pmin ))
   # If llen is too long, reduce it:
-  [ "$llen" -gt $(( width - pmin - rlen )) ] && llen=$(( width - pmin - rlen ))
+  [ "$llen" -gt $(( LINEWIDTH - pmin - rlen )) ] && llen=$(( LINEWIDTH - pmin - rlen ))
   # If llen is too short, increase the padding:
-  [ $(( llen + plen + rlen )) -lt "$width" ] && plen=$(( width - llen - rlen ))
-  # Ok, print it:
-  echo "${lmsg:0:llen}${pad:0:plen}${rmsg:0:rlen}"
+  [ $(( llen + plen + rlen )) -lt "$LINEWIDTH" ] && plen=$(( LINEWIDTH - llen - rlen ))
+  echo $llen $plen $rlen
   return 0
 }

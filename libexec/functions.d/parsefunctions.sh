@@ -3,377 +3,269 @@
 # All rights reserved.  For licence details, see the file 'LICENCE'.
 #-------------------------------------------------------------------------------
 # parsefunctions.sh - parse functions for slackrepo
-#   parse_args
-#   scan_dir
-#   scan_queuefile
-#   add_parsed_file
-#   find_slackbuild
-#   find_queuefile
+#   parse_arg
+#   find_items
 #   parse_package_name
 #   parse_info_and_hints
 #-------------------------------------------------------------------------------
 
-declare -a PARSEDLIST UNPARSEDLIST
+declare -a PARSEDARGS
+declare -A ITEMDIR ITEMFILE ITEMPRGNAM PRGNAMITEMID
 
-function parse_args
-# Parse item names
-# $1 = -s => look up in SlackBuild repo, or -p => look up in Package repo
-# $* = the item names to be parsed :-)
-# Also uses $BLAME which the caller can set to prefix errors and warnings
-# PARSEDLIST and UNPARSEDLIST must be unset before calling parse_args
-#
-# Results are returned in the following global arrays:
-#   PARSEDLIST -- a list of item IDs that need to be processed
-#   ITEMFILE -- the filename of the SlackBuild or package to be processed
-#   ITEMDIR -- the path (relative to the repo root) of the directory that contains ITEMFILE
-#   ITEMPRGNAM -- the prgnam of the SlackBuild or package
-#   UNPARSEDLIST -- a list of newly discovered subdirectory names that need to be parsed
-#
-# Return status:
-# 0 = all ok
-# 1 = errors logged
-#
-{
-  [ "$OPT_TRACE" = 'y' ] && echo -e ">>>> ${FUNCNAME[*]}\n     $*" >&2
-
-  local itemid
-  local searchtype toplevel
-  local errstat=0
-  local blamemsg=''
-  [ -n "$BLAME" ] && blamemsg="${BLAME}: "
-
-  if [ "$1" = '-s' ]; then
-    searchtype='-s'
-    toplevel=$(realpath "$SR_SBREPO")
-    shift
-  elif [ "$1" = '-p' ]; then
-    searchtype='-p'
-    toplevel=$(realpath "$SR_PKGREPO")
-    shift
-  else
-    # Assume it's '-s', and treat $1 as an item
-    searchtype='-s'
-    toplevel=$(realpath "$SR_SBREPO")
+# Deal with SBo categories that have the same name as a Slackware-current package:
+declare -A IGNORE_CURRENT
+IGNORE_CURRENT["perl"]='y'
+IGNORE_CURRENT["python"]='y'
+IGNORE_CURRENT["ruby"]='y'
+# Deal with SBo deps that are in Slackware-current but the package name is different:
+declare -A PKG_IN_CURRENT
+# "<current>=<SBo>"
+for pp in \
+  "python=pysetuptools" \
+  "gst-plugins-base=gst1-plugins-base" \
+  "gst-plugins-good=gst1-plugins-good" \
+  "gstreamer=gstreamer1" \
+  "qt-gstreamer=QtGStreamer" \
+  "openjpeg=openjpeg2" \
+; do
+  pslack="${pp/=*/}"
+  psbo="${pp/*=/}"
+  is_installed "${pslack}-v-a-bt"
+  iistat=$?
+  if [ $iistat = 0 ] || [ $iistat = 1 ]; then
+    PKG_IN_CURRENT["$psbo"]="$R_INSTALLED"
   fi
+done
 
-  cd "$toplevel"
+#-------------------------------------------------------------------------------
+
+declare -a R_ITEMLIST
+
+function parse_arg
+# Parse an argument into a list of item names.
+# The item names returned depend on which command is running
+# (e.g. the revert command will look for items that have backups).
+# $1 = the argument to be parsed, shell-style globs are supported
+# $2 = if looking up a dependency, the itemid we are processing, otherwise null
+# Results are returned in this global array:
+#   PARSEDARGS -- a list of item IDs that need to be processed
+# Return status: always 0 -- if $1 is 100% rubbish, PARSEDARGS will be empty
+{
+  local firstarg="$1"
+  local callerid="$2"
+  local -a objlist dependers
+  local newitemid prgnam
+  PARSEDARGS=()
+
+  # Although we only accept one arg, some args can expand (e.g. requires::arg)
+  set -- "$firstarg"
 
   while [ $# != 0 ]; do
-
-    item=$(realpath -m "$1")
+    arg="${1%%/}"
     shift
 
-    # An item can be an absolute pathname of an object; or a relative pathname
-    # of an object; or the basename of an object deep in the repo, provided that
-    # there is only one object with that name.  An object can be either a directory
-    # or a file.  Queuefiles are special.
-
-    # Queuefile?
-    if [ "${item##*.}" = 'sqf' ]; then
-      find_queuefile "$item"
-      if [ $? = 0 ]; then
-        scan_queuefile "$R_QUEUEFILE"
+    # Shortcuts:
+    if [ -n "${ITEMPRGNAM[$arg]}" ]; then
+      # it's an already-valid itemid
+      PARSEDARGS+=( "$arg" )
+      continue
+    elif [ -n "${PRGNAMITEMID[$arg]}" ]; then
+      # it's an already-valid prgnam
+      PARSEDARGS+=( "${PRGNAMITEMID[$arg]}" )
+      continue
+    elif [ "$SYS_CURRENT" = 'y' ] && [ "$arg" != 'perl' ] && [ "$arg" != 'python' ]; then
+      # if there is a package in Slackware-current, don't look in our own repo
+      if [ -n "${IGNORE_CURRENT[$arg]}" ]; then
+        iistat=999
+      elif [ -n "${PKG_IN_CURRENT[$arg]}" ]; then
+        iistat=0
       else
-        log_warning "${itemid}: Queuefile $item not found"
+        is_installed "${arg}-v-a-bt"
+        iistat=$?
       fi
-      continue
-    fi
-
-    # Absolute path?
-    if [ "${item:0:1}" = '/' ]; then
-      # but is it outside the repo?
-      if [ "${item:0:${#toplevel}}" = "$toplevel" ]; then
-        # in the repo => make it relative
-        item="${item:$(( ${#toplevel} + 1 ))}"
-      else
-        # not in the repo => complain
-        log_error "${blamemsg}Item $item is not in $toplevel"
-        errstat=1
-        continue
-      fi
-    fi
-
-    # Null?  Interpret that as "whatever is in the repo's root directory":
-    if [ "$item" = '' ]; then
-      scan_dir "$searchtype" .
-      continue
-    fi
-
-    # Assume it's a relative path - does it exist?
-    if [ -f "$item" ]; then
-      add_parsed_file "$searchtype" "$item"
-      continue
-    elif [ -d "$item" ]; then
-      scan_dir "$searchtype" "$item"
-      continue
-    elif [ -n "$(echo "$item" | sed 's:[^/]::g')" ]; then
-      log_error "${blamemsg}Item $item not found"
-      errstat=1
-      continue
-    fi
-
-    # Search for anything with the right name
-    gotitems=( $(find -L . -name "$item" -print | sed 's:^\./::') )
-    if [ "${#gotitems}" = 0 ]; then
-      log_error "${blamemsg}Item $item not found"
-      errstat=1
-      continue
-    elif [ "${#gotitems[@]}" = 1 ]; then
-      if [ -f "${gotitems[0]}" ]; then
-        add_parsed_file "$searchtype" "${gotitems[0]}"
-        continue
-      else
-        scan_dir "$searchtype" "${gotitems[0]}"
-        continue
-      fi
-    else
-      log_error "${blamemsg}Multiple matches for $item in $toplevel: ${gotitems[*]}"
-      errstat=1
-      continue
-    fi
-
-  done
-
-  return $errstat
-
-}
-
-#-------------------------------------------------------------------------------
-
-declare -A ITEMDIR ITEMFILE ITEMPRGNAM
-
-function add_parsed_file
-# Adds an item ID for the file to the global array $PARSEDLIST. The ID is a
-# user-friendly name for the item: if the item is cat/prg/prg.(SlackBuild|sh),
-# then the ID will be shortened to "cat/prg".
-# Also sets the following:
-# $ITEMDIR[$id] = the directory of the item relative to SR_SBREPO
-# $ITEMFILE[$id] = the full basename of the file (prgnam.SlackBuild, mate-build-base.sh, etc)
-# $ITEMPRGNAM[$id] = the basename of the item with .(SlackBuild|sh) removed
-# $1 = -s => look up in SlackBuild repo, or -p => look up in Package repo
-# $2 = pathname (relative to the repo) of the file to add as an item
-# Returns: always 0
-{
-  [ "$OPT_TRACE" = 'y' ] && echo -e ">>>> ${FUNCNAME[*]}\n     $*" >&2
-
-  local searchtype="$1"
-  local id="$2"
-  local dir=$(dirname "$id")
-  local dirbase=$(basename "$dir")
-  local file=$(basename "$id")
-  local prgnam
-
-  if [ "$searchtype" = '-s' ]; then
-    # For SlackBuild lookups, get prgnam from the filename:
-    prgnam=$(echo "$file" | sed -r 's/\.(SlackBuild|sh)$//')
-    # Simplify $id if it's unambiguous:
-    [ "$prgnam" = "$dirbase" ] && id="$dir"
-  else
-    # For package lookups, get prgnam from the containing directory's name:
-    prgnam="$dirbase"
-    # and simplify $id, just like above:
-    id="$dir"
-  fi
-  ITEMDIR[$id]="$dir"
-  ITEMFILE[$id]="$file"
-  ITEMPRGNAM[$id]="$prgnam"
-  PARSEDLIST+=( "$id" )
-  return 0
-}
-
-#-------------------------------------------------------------------------------
-
-function find_slackbuild
-# Find a SlackBuild in the repo.  Populates arrays ITEM{DIR,FILE,PRGNAM}, and
-# returns the SlackBuild's itemid (key for ITEM{DIR,FILE,PRGNAM}) in $R_SLACKBUILD.
-# $1 = prgnam
-# Return status:
-# 0 = all ok
-# 1 = not found
-# 2 = multiple matches
-{
-  [ "$OPT_TRACE" = 'y' ] && echo -e ">>>> ${FUNCNAME[*]}\n     $*" >&2
-
-  unset R_SLACKBUILD
-  local prgnam="$1"
-  local file="${prgnam}.SlackBuild"
-
-  sblist=( $(find -L "$SR_SBREPO" -name "$file" 2>/dev/null) )
-  if [ "${#sblist[@]}" = 0 ]; then
-    return 1
-  elif [ "${#sblist[@]}" != 1 ]; then
-    return 2
-  fi
-
-  dir=$(dirname "${sblist[0]:$(( ${#SR_SBREPO} + 1 ))}")
-  dirbase=$(basename "$dir")
-
-  id="$dir"/"$file"
-  [ "$prgnam" = "$dirbase" ] && id="$dir"
-
-  ITEMDIR[$id]="$dir"
-  ITEMFILE[$id]="$file"
-  ITEMPRGNAM[$id]="$prgnam"
-  R_SLACKBUILD="$id"
-  return 0
-}
-
-#-------------------------------------------------------------------------------
-
-function find_queuefile
-# Find a queuefile.  Returns its pathname in R_QUEUEFILE.
-# $1 = queuefile pathname (with or without .sqf suffix)
-# Return status:
-# 0 = all ok
-# 1 = not found
-# 2 = multiple matches
-{
-  [ "$OPT_TRACE" = 'y' ] && echo -e ">>>> ${FUNCNAME[*]}\n     $*" >&2
-
-  unset R_QUEUEFILE
-  local qpath="$1"
-  # try a quick win
-  if [ -f "$qpath" ]; then
-    R_QUEUEFILE="$qpath"
-    return 0
-  fi
-
-  local -a qlist
-  local qbase="$(basename "$1")"
-  local qfound=''
-  local -a qsearch=( "$SR_QUEUEDIR" "$SR_HINTDIR" "$SR_SBREPO" )
-  for trydir in "${qsearch[@]}"; do
-    qlist=( $(find -L "$trydir" -name "$qbase" 2>/dev/null) )
-    if [ "${#qlist[@]}" = 0 ]; then
-      continue
-    elif [ "${#qlist[@]}" = 1 ]; then
-      qfound="${qlist[0]}"
-      break
-    else
-      return 2
-    fi
-  done
-  [ "$qfound" = '' ] && return 1
-  R_QUEUEFILE="$qfound"
-  return 0
-}
-
-#-------------------------------------------------------------------------------
-
-# Queuefile processing needs a special hint to stop factorial explosion when
-# enumerating the fake deps:
-declare -A HINT_Q
-
-function scan_queuefile
-# Scans a queuefile, finding its slackbuilds (with options and inferred deps).
-# Sets the itemid of the last slackbuild in the queue in $lastinqueuefile so
-# the caller (probably scan_queuefile ;-) can use it as a dep of the next item.
-# $1 = pathname of the queuefile to scan
-# Return status: always 0 (any bad slackbuilds are ignored)
-{
-  [ "$OPT_TRACE" = 'y' ] && echo -e ">>>> ${FUNCNAME[*]}\n     $*" >&2
-
-  local sqfile="$1"
-  local -a fakedeps
-  local depid
-
-  if [ ! -f "$sqfile" ]; then
-    if [ -f "$SR_QUEUEDIR"/"$sqfile" ]; then
-      sqfile="$SR_QUEUEDIR"/"$sqfile"
-    else
-      log_warning "${sqfile}: No such queuefile"
-      return 1
-    fi
-  fi
-
-  while read sqfitem sqfoptions ; do
-    case $sqfitem
-    in
-      @*) find_queuefile "${sqfitem:1}".sqf
-          if [ $? = 0 ]; then
-            scan_queuefile "$R_QUEUEFILE"
-            fakedeps+=( "$lastinqueuefile" )
-          else
-            log_warning "${itemid}: Queuefile ${sqfitem:1}.sqf not found"
-          fi
-          ;;
-      -*) log_verbose "Note: ignoring unselected queuefile item ${sqfitem:1}"
-          ;;
-      * ) find_slackbuild "$sqfitem"
-          fstat=$?
-          if [ $fstat = 0 ]; then
-            PARSEDLIST+=( "$R_SLACKBUILD" )
-            HINT_Q["$R_SLACKBUILD"]="$queuefile"
-            # add sqfitem to fakedeps *after* adding fakedeps to INFOREQUIRES
-            # so that sqfitem won't depend on itself
-            INFOREQUIRES["$R_SLACKBUILD"]="${fakedeps[*]}"
-            fakedeps+=( "$sqfitem" )
-          elif [ $fstat = 1 ]; then
-            log_warning "${itemid}: Queuefile dep $sqfitem not found"
-          elif [ $fstat = 2 ]; then
-            log_warning "${itemid}: Queuefile dep $sqfitem matches more than one SlackBuild"
-          fi
-          if [ -n "$sqfoptions" ]; then
-            HINT_OPTIONS["$R_SLACKBUILD"]="$(echo "$sqfoptions" | sed 's/^ *| *//')"
-          fi
-          ;;
-    esac
-  done < "$sqfile"
-  lastinqueuefile="$sqfitem"
-  return 0
-}
-
-#-------------------------------------------------------------------------------
-
-function scan_dir
-# Looks in directories for files or subdirectories.
-# $1 = -s => look up in SlackBuild repo, or -p => look up in Package repo
-# $2 = pathname (relative to the repo) of the directory to scan
-# Returns: always 0
-{
-  [ "$OPT_TRACE" = 'y' ] && echo -e ">>>> ${FUNCNAME[*]}\n     $*" >&2
-
-  local searchtype="$1"
-  local dir="$2"
-  local dirbase
-  local -a subdirlist pkglist itemlist
-  dirbase=$(basename "$dir")
-  if [ "$searchtype" = '-s' ]; then
-    if [ -f "$dir"/"$dirbase".SlackBuild ]; then
-      add_parsed_file "$searchtype" "$dir"/"$dirbase".SlackBuild
-      return 0
-    fi
-  else
-    pkglist=( "$dir"/*.t?z )
-    itemlist=()
-    for pkg in "${pkglist[@]}"; do
-      if [ -f "$pkg" ]; then
-        pkgbase="${pkg##*/}"
-        pkgnam="${pkgbase%-*-*-*}"
-        itemnam=$(db_get_pkgnam_itemid "$pkgnam");
-        if [ -z "$itemnam" ]; then
-          # database record unavailable? Well we'll have to guess :-/
-          itemnam="$dir"
+      if [ $iistat = 0 ] || [ $iistat = 1 ]; then
+        [ -z "${PKG_IN_CURRENT[$arg]}" ] && PKG_IN_CURRENT["$arg"]="$R_INSTALLED"
+        if [ -n "$callerid" ]; then
+          log_info "${callerid}: using ${PKG_IN_CURRENT[$arg]} for dependency ${arg}"
+        else
+          log_start "$arg"; log_itemfinish "$arg" "skipped" "" "${arg} is already installed as ${PKG_IN_CURRENT[$arg]}"
         fi
-        itemlist+=( "$itemnam" )
+        continue
       fi
-    done
-    for itemid in $(printf "%s\n" "${itemlist[@]}" | sort -u); do
-      slackbuildpath="$dir"/$(basename "$itemid").SlackBuild
-      add_parsed_file "$searchtype" "$slackbuildpath"
+    fi
+
+    # Special processing:
+    case "$arg" in
+    *::* )
+      prefix="${arg%::*}"
+      suffix="${arg#*::}"
+      case "$prefix" in
+        'requires' )
+          if [ -n "$callerid" ]; then
+            log_warning -a "${callerid}: ignored ${prefix}::${suffix} (invalid in a dependency list)"
+          else
+            #### this is experimental!
+            readarray -t dependers < <(db_get_dependers "${suffix}")
+            [ "${#dependers}" != 0 ] && set -- "$@" "${dependers[@]}"
+          fi
+          ;;
+        * )
+          # cross-repo support coming soon :D
+          if [ -n "$callerid" ]; then
+            log_warning -a "${callerid}: ignored ${prefix}::${suffix} (not yet implemented)"
+          else
+            log_start "$arg"; log_itemfinish "${prefix}::${suffix}" "bad" "" "Not yet implemented"
+          fi
+          ;;
+      esac
+      continue
+      ;;
+    esac
+
+    case "$CMD" in
+    'build' | 'rebuild' )
+      find_items "$arg" -s
+      ;;
+    'update' | 'lint' )
+      if [ -n "$callerid" ] || [ "$CMD" = 'lint' ]; then
+        # update: deps can be unbuilt, so we need to search both repos
+        # lint: happy to process whatever actually exists
+        find_items "$arg" -ps
+      else
+        find_items "$arg" -p
+      fi
+      ;;
+    'remove' )
+      find_items "$arg" -p
+      ;;
+    'revert' )
+      find_items "$arg" -b
+      ;;
+    * )
+      find_items "$arg" -s
+      ;;
+    esac
+
+    if [ -n "$callerid" ] && [ "${#R_ITEMLIST[@]}" = 0 ]; then
+      # nothing in the repo :-/
+      # if we need a dep, look for an installed package (poss from another repo)
+      guesspkgnam="$(basename "${arg/.*/}")"
+      is_installed "${guesspkgnam}-v-a-bt"
+      iistat=$?
+      if [ $iistat = 0 ] || [ $iistat = 1 ]; then
+        log_warning -a "${callerid}: Found installed package ${R_INSTALLED} for ${arg} (not in repo)"
+        continue
+      else
+        log_warning -a "${callerid}: Dependency ${arg} does not exist and has been ignored"
+      fi
+    fi
+
+    PARSEDARGS+=( "${R_ITEMLIST[@]}" )
+
+  done
+
+  if [ -z "$callerid" ] && [ "${#PARSEDARGS[@]}" = 0 ]; then
+    log_start "$firstarg"; log_itemfinish "$firstarg" "bad" "" "No matches found for $CMD command"
+  fi
+
+  return 0
+}
+
+#-------------------------------------------------------------------------------
+
+function find_items
+# Print a newline-separated list on standard output of itemids that match a glob
+# $1 = glob
+# $2 = where to find the items
+#       -s = SlackBuild repo
+#       -p = package database
+#       -b = backup repo
+#       -ps = package database with fallback to SlackBuild repo
+# Also needs to inherit $callerid from parse_arg
+#
+# Populates arrays ITEMPRGNAM, PRGNAMITEMID, ITEMDIR, ITEMFILE
+# and returns the itemids (key for ITEM{DIR,FILE,PRGNAM}) in $R_ITEMLIST.
+#   ITEMPRGNAM -- the prgnam of the SlackBuild or package
+#   PRGNAMITEMID -- the itemid of the prgnam
+#   ITEMDIR -- the path (relative to the repo root) of the directory that contains ITEMFILE
+#  and if the SlackBuild exists (note, for update/remove/revert/lint it might not exist)
+#   ITEMFILE -- the filename of the SlackBuild to be processed
+#
+# By the way, we'll try not to barf when paths have embedded spaces, but if you're
+# gormless enough to have paths with embedded newlines you can sod off right now.
+# Return status: always 0
+{
+  local glob="$1"
+  local lookuptype="$2"
+  local -a objlist dirlist
+  local object filenam prgnam dirnam dirbase newitemid
+
+  R_ITEMLIST=()
+
+  if [ "$lookuptype" = "-p" ] || [ "$lookuptype" = "-ps" ]; then
+    readarray -t objlist < <(db_get_itemids "$glob")
+    if [ "$lookuptype" = "-ps" ] && [ "${#objlist[@]}" = 0 ]; then
+      # hey, I wonder how we can lookup the SlackBuilds?
+      find_items "${glob}" -s
       return 0
-    done
+      # :D
+    fi
+
+  elif [ "$lookuptype" = "-s" ]; then
+    readarray -t objlist < <(db_get_slackbuilds "$glob")
+    if [ "${#objlist[@]}" = 0 ]; then
+      # maybe it's a script name e.g. <thing>.sh
+      : #### we'll implement that later ;-)
+    fi
+
+  elif [ "$lookuptype" = '-b' ]; then
+    # Performance isn't really important for 'revert', so let's do it the slow way.
+    case "$glob" in
+      *.t?z )
+        # explicit filename, including wildcards
+        readarray -t objlist < <(cd "$SR_PKGBACKUP"; find -L . -type f -path "*/${glob}" | sort)
+        ;;
+      * )
+        readarray -t objlist < <(cd "$SR_PKGBACKUP"; find -L . -type f -path "*/${glob}.t?z" | sort)
+        # found nothing?  assume it's a directory name and look inside:
+        if [ "${#objlist[@]}" = 0 ]; then
+          readarray -t dirlist < <(cd "$SR_PKGBACKUP"; find -L . -type d -path "*/${glob}" | sort)
+          [ "${#dirlist[@]}" != 0 ] && readarray -t objlist < <(cd "$SR_PKGBACKUP"; find -L "${dirlist[@]}" -type f -name "*.t?z" | sort)
+        fi
+        ;;
+    esac
+
   fi
-  # Descend one level only - some SlackBuilds have subdirectories
-  # (eg. for patches) that need to be ignored
-  subdirlist=( $(find -L "$dir" -mindepth 1 -maxdepth 1 -type d -not -name '.*' | sort | sed 's:^\./::') )
-  if [ "${#subdirlist[@]}" = 0 ]; then
-    log_normal "${blamemsg}${dir} does not contain a SlackBuild"
-    return 0
-  fi
-  # don't recurse (which would take a long time), just return the list of subdirectories
-  # (the main loop will parse and process them after it has processed the parsed items)
-  UNPARSEDLIST+=( "${subdirlist[@]}" )
+
+  for object in "${objlist[@]}"; do
+    if [ "$lookuptype" = '-b' ]; then
+      newitemid=$(dirname "${object#./}")
+      prgnam=$(basename "$newitemid")
+      dirnam="$newitemid"
+      filenam=""
+    elif [ "$lookuptype" = '-p' ] || [ "$lookuptype" = '-ps' ]; then
+      newitemid="${object}"
+      prgnam=$(basename "$newitemid")
+      dirnam="$newitemid"
+      filenam=""
+      [ -f "$SR_SBREPO/${dirnam}/${prgnam}.SlackBuild" ] && filenam="${prgnam}.SlackBuild"
+      [ -f "$SR_SBREPO/${dirnam}/${prgnam}" ] && filenam="${prgnam}"
+    else # "$lookuptype" = '-s'
+      filenam=$(basename "${object}")
+      prgnam="${filenam%.SlackBuild}"
+      dirnam=$(dirname "${object#./}")
+      [ -z "$dirnam" ] && dirnam="."  #### needs to support slackbuild in repo's root dir
+      dirbase=$(basename "$dirnam")
+      newitemid="$dirnam/$filenam"
+      [ "$prgnam" = "$dirbase" ] && newitemid="$dirnam"
+    fi
+    ITEMPRGNAM[$newitemid]="$prgnam"
+    PRGNAMITEMID[$prgnam]="$newitemid"
+    ITEMDIR[$newitemid]="$dirnam"
+    [ -n "$filenam" ] && ITEMFILE[$newitemid]="$filenam"
+    R_ITEMLIST+=( "$newitemid" )
+  done
+
   return 0
 }
 
@@ -387,7 +279,6 @@ function parse_package_name
 # Returns global variables PN_{PRGNAM,VERSION,ARCH,BUILD,TAG,PKGTYPE}
 # Return status: always 0
 {
-  [ "$OPT_TRACE" = 'y' ] && echo -e ">>>> ${FUNCNAME[*]}\n     $*" >&2
   local pkgnam=$(basename "$1")
   PN_PRGNAM=$(echo "$pkgnam" | rev | cut -f4- -d- | rev)
   PN_VERSION=$(echo "$pkgnam" | rev | cut -f3 -d- | rev)
@@ -395,7 +286,7 @@ function parse_package_name
   PN_BUILD=$(echo "$pkgnam" | rev | cut -f1 -d- | rev | sed 's/[^0-9]*$//')
   PN_TAG=$(echo "$pkgnam" | rev | cut -f1 -d- | rev | sed 's/^[0-9]*//' | sed 's/\..*$//')
   PN_PKGTYPE=$(echo "$pkgnam" | rev | cut -f1 -d- | rev | sed 's/^[0-9]*//' | sed 's/^.*\.//')
-  return
+  return 0
 }
 
 #-------------------------------------------------------------------------------
@@ -406,10 +297,12 @@ declare -A INFOVERSION INFOREQUIRES INFODOWNLIST INFOMD5LIST INFOSHA256LIST
 declare -A SRCDIR GITREV GITDIRTY
 # and to store hints:
 declare -A \
-  HINT_SKIP HINT_MD5IGNORE HINT_SHA256IGNORE HINT_NUMJOBS HINT_INSTALL HINT_SPECIAL \
+  HINT_MD5IGNORE HINT_SHA256IGNORE HINT_NUMJOBS HINT_INSTALL HINT_PRAGMA \
   HINT_ARCH HINT_CLEANUP HINT_USERADD HINT_GROUPADD HINT_ANSWER HINT_NODOWNLOAD \
-  HINT_PREREMOVE HINT_CONFLICTS \
-  HINT_OPTIONS HINT_VERSION HINT_SUMMARY HINTFILE
+  HINT_CONFLICTS \
+  HINT_OPTIONS HINT_VERSION HINTFILE
+# and for validation in test_*
+declare -A VALID_USERS VALID_GROUPS
 
 #-------------------------------------------------------------------------------
 
@@ -420,14 +313,16 @@ function parse_info_and_hints
 # Return status:
 # 0 = normal
 # 1 = skipped/unsupported/untested
+# 2 = no files (probably pending removal)
 {
-  [ "$OPT_TRACE" = 'y' ] && echo -e ">>>> ${FUNCNAME[*]}\n     $*" >&2
-
   local itemid="$1"
   local itemprgnam="${ITEMPRGNAM[$itemid]}"
   local itemdir="${ITEMDIR[$itemid]}"
   local itemfile="${ITEMFILE[$itemid]}"
 
+  if [ -z "${ITEMFILE[$itemid]}" ]; then
+    return 1
+  fi
 
   # INFO DEPARTMENT
   # ===============
@@ -510,7 +405,8 @@ function parse_info_and_hints
       local PRGNAM SRCNAM
       eval "$(grep 'PRGNAM=' "$SR_SBREPO"/"$itemdir"/"$itemfile")"
       eval "$(grep 'SRCNAM=' "$SR_SBREPO"/"$itemdir"/"$itemfile")"
-      eval "INFODOWNLIST[$itemid]=$(sed ':x; /\\$/ { N; s/\\\n//; tx }' <"$SR_SBREPO"/"$itemdir"/"$itemfile" | grep 'wget -c ' | sed 's/wget -c //')"
+      eval "INFODOWNLIST[$itemid]=\"$(sed ':x; /\\$/ { N; s/\\\n//; tx }' <"$SR_SBREPO"/"$itemdir"/"$itemfile" | grep 'wget  *-c  *' | sed 's/wget  *-c  *//')\""
+      #### Ideally if this sneaky download failed we would run the whole SlackBuild anyway...
       HINT_MD5IGNORE[$itemid]='y'
       HINT_SHA256IGNORE[$itemid]='y'
     fi
@@ -542,6 +438,7 @@ function parse_info_and_hints
   if [ "${HINTFILE[$itemid]+yesitisset}" != 'yesitisset' ]; then
     hintfile=''
     hintsearch=( "$SR_SBREPO"/"$itemdir" "$SR_HINTDIR" "$SR_HINTDIR"/"$itemdir" )
+    [ -n "$SR_DEFAULT_HINTDIR" ] && hintsearch+=( "$SR_DEFAULT_HINTDIR" "$SR_DEFAULT_HINTDIR"/"$itemdir" )
     for trydir in "${hintsearch[@]}"; do
       if [ -f "$trydir"/"$itemprgnam".hint ]; then
         hintfile="$trydir"/"$itemprgnam".hint
@@ -553,21 +450,19 @@ function parse_info_and_hints
 
   if [ -n "${HINTFILE[$itemid]}" ] && [ -s "${HINTFILE[$itemid]}" ]; then
     local SKIP \
-          VERSION ADDREQUIRES OPTIONS GROUPADD USERADD PREREMOVE CONFLICTS INSTALL NUMJOBS ANSWER CLEANUP \
-          SPECIAL ARCH DOWNLOAD MD5SUM SHA256SUM
+          VERSION ADDREQUIRES OPTIONS GROUPADD USERADD CONFLICTS INSTALL NUMJOBS ANSWER CLEANUP \
+          PRAGMA SPECIAL ARCH DOWNLOAD MD5SUM SHA256SUM
     . "${HINTFILE[$itemid]}"
 
     # Process the hint file's variables individually (looping for each variable would need
     # 'eval', which would mess up the payload, so we don't do that).
     [ -n "$OPTIONS"   ] &&   HINT_OPTIONS[$itemid]="$OPTIONS"
-    [ -n "$GROUPADD"  ] &&  HINT_GROUPADD[$itemid]="$GROUPADD"
-    [ -n "$USERADD"   ] &&   HINT_USERADD[$itemid]="$USERADD"
-    [ -n "$PREREMOVE" ] && HINT_PREREMOVE[$itemid]="$PREREMOVE"
     [ -n "$CONFLICTS" ] && HINT_CONFLICTS[$itemid]="$CONFLICTS"
     [ -n "$NUMJOBS"   ] &&   HINT_NUMJOBS[$itemid]="$NUMJOBS"
     [ -n "$ANSWER"    ] &&    HINT_ANSWER[$itemid]="$ANSWER"
     [ -n "$CLEANUP"   ] &&   HINT_CLEANUP[$itemid]="$CLEANUP"
-    [ -n "$SPECIAL"   ] &&   HINT_SPECIAL[$itemid]="$SPECIAL"
+    [ -n "$PRAGMA"    ] &&    HINT_PRAGMA[$itemid]="$PRAGMA"
+    [ -n "$SPECIAL"   ] &&    HINT_PRAGMA[$itemid]="$SPECIAL"
 
     # Process hint file's INSTALL
     if [ -n "$INSTALL" ]; then
@@ -609,24 +504,79 @@ function parse_info_and_hints
       HINT_SHA256IGNORE[$itemid]=''
     fi
 
+    # Process hint file's GROUPADD and USERADD together:
+    # GROUPADD hint format: GROUPADD="<gnum>:<gname> ..."
+    # USERADD hint format:  USERADD="<unum>:<uname>:[-g<ugroup>:][-d<udir>:][-s<ushell>:][-uargs:...] ..."
+    # VALID_GROUPS and VALID_USERS are needed for test_package
+    if [ -n "$GROUPADD}" ]; then
+      for groupstring in $GROUPADD; do
+        gnum=''; gname="$itemprgnam"
+        for gfield in $(echo "$groupstring" | tr ':' ' '); do
+          case "$gfield" in
+            [0-9]* ) gnum="$gfield" ;;
+            * ) gname="$gfield" ;;
+          esac
+        done
+        [ -z "$gnum" ] && { log_warning "${itemid}: GROUPADD hint has no GID number" ; break ; }
+        if ! getent group "$gname" | grep -q "^${gname}:" 2>/dev/null ; then
+          HINT_GROUPADD[$itemid]="${HINT_GROUPADD[$itemid]}groupadd -g $gnum $gname; "
+        else
+          log_info -a "Group $gname already exists."
+        fi
+        if [ -z "${VALID_GROUPS[$itemid]}" ]; then
+          VALID_GROUPS[$itemid]="$gnum|$gname"
+        else
+          VALID_GROUPS[$itemid]="${VALID_GROUPS[$itemid]}|$gnum|$gname"
+        fi
+      done
+    fi
+    if [ -n "$USERADD" ]; then
+      for userstring in $USERADD; do
+        unum=''; uname="$itemprgnam"; ugroup=""
+        udir='/dev/null'; ushell='/bin/false'; uargs=''
+        for ufield in $(echo "$userstring" | tr ':' ' '); do
+          case "$ufield" in
+            -g* ) ugroup="${ufield:2}" ;;
+            -d* ) udir="${ufield:2}" ;;
+            -s* ) ushell="${ufield:2}" ;;
+            -*  ) uargs="$uargs ${ufield:0:2} ${ufield:2}" ;;
+            /*  ) if [ -x "$ufield" ]; then ushell="$ufield"; else udir="$ufield"; fi ;;
+            [0-9]* ) unum="$ufield" ;;
+            *   ) uname="$ufield" ;;
+          esac
+        done
+        [ -z "$unum" ] && { log_warning "${itemid}: USERADD hint has no UID number" ; break ; }
+        if ! getent passwd "$uname" | grep -q "^${uname}:" 2>/dev/null ; then
+          [ -z "$ugroup" ] && ugroup="$uname"
+          HINT_USERADD[$itemid]="${HINT_USERADD[$itemid]}useradd  -u $unum -g $ugroup -c $itemprgnam -d $udir -s $ushell $uargs $uname; "
+        else
+          log_info -a "User $uname already exists."
+        fi
+        if [ -z "${VALID_USERS[$itemid]}" ]; then
+          VALID_USERS[$itemid]="$unum|$uname"
+        else
+          VALID_USERS[$itemid]="${VALID_USERS[$itemid]}|$unum|$uname"
+        fi
+      done
+    fi
+
     # Process SKIP and ADDREQUIRES in the Fixup department below.
     briefskip="${SKIP:0:20}"
     [ "${#SKIP}" -gt 20 ] && briefskip="${SKIP:0:17}..."
 
-    log_verbose "Hints for $itemid:"
-    log_verbose "$(printf '  %s\n' \
+    log_info "Hints for $itemid:"
+    log_info "$(printf '  %s\n' \
       ${SKIP+"SKIP=\"${briefskip}\""} \
       ${VERSION+"VERSION=\"$VERSION\""} \
       ${OPTIONS+"OPTIONS=\"$OPTIONS\""} \
       ${GROUPADD+"GROUPADD=\"$GROUPADD\""} \
       ${USERADD+"USERADD=\"$USERADD\""} \
-      ${PREREMOVE+"PREREMOVE=\"$PREREMOVE\""} \
       ${CONFLICTS+"CONFLICTS=\"$CONFLICTS\""} \
       ${INSTALL+"INSTALL=\"$INSTALL\""} \
       ${NUMJOBS+"NUMJOBS=\"$NUMJOBS\""} \
       ${ANSWER+"ANSWER=\"$ANSWER\""} \
       ${CLEANUP+"CLEANUP=\"$CLEANUP\""} \
-      ${SPECIAL+"SPECIAL=\"$SPECIAL\""} \
+      ${PRAGMA+"PRAGMA=\"$PRAGMA\""} \
       ${ARCH+"ARCH=\"$ARCH\""} \
       ${DOWNLOAD+"DOWNLOAD=\"$DOWNLOAD\""} \
       ${MD5SUM+"MD5SUM=\"$MD5SUM\""} \
@@ -634,17 +584,18 @@ function parse_info_and_hints
       ${ADDREQUIRES+"ADDREQUIRES=\"$ADDREQUIRES\""} )"
 
     unset VERSION OPTIONS GROUPADD USERADD \
-          PREREMOVE CONFLICTS \
+          CONFLICTS \
           INSTALL NUMJOBS ANSWER CLEANUP \
-          SPECIAL ARCH DOWNLOAD MD5SUM SHA256SUM
+          PRAGMA SPECIAL ARCH DOWNLOAD MD5SUM SHA256SUM
 
   fi
 
   # FIXUP DEPARTMENT
   # ================
 
-  # Fix INFOREQUIRES from ADDREQUIRES, if possible
+  # Fix INFOREQUIRES
   if [ "${INFOREQUIRES[$itemid]+yesitisset}" != 'yesitisset' ]; then
+    # If not set, set it from ADDREQUIRES, if possible
     if [ -v ADDREQUIRES ]; then
       INFOREQUIRES[$itemid]="$ADDREQUIRES"
     else
@@ -652,11 +603,8 @@ function parse_info_and_hints
       INFOREQUIRES[$itemid]=""
     fi
   else
-    # Get rid of %README% if and only if ADDREQUIRES is set.
-    if [ -v ADDREQUIRES ]; then
-      INFOREQUIRES[$itemid]="$(echo ${INFOREQUIRES[$itemid]//%README%/} ${ADDREQUIRES})"
-    # Else %README% will remain, and calculate_deps will issue a warning.
-    fi
+    # Get rid of %README% silently, and append ADDREQUIRES
+    INFOREQUIRES[$itemid]="$(echo ${INFOREQUIRES[$itemid]//%README%/} ${ADDREQUIRES})"
   fi
 
   # Fix INFOVERSION from hint file's VERSION, or DOWNLOAD, or git, or SlackBuild's modification time
@@ -668,7 +616,7 @@ function parse_info_and_hints
   [ -z "$ver" ] && ver="$(date --date=@"$(stat --format='%Y' "$SR_SBREPO"/"$itemdir"/"$itemfile")" '+%Y%m%d')"
   INFOVERSION[$itemid]="$ver"
 
-  # Process SKIP last so that we've got rid of %README%.
+  # Process SKIP last, so we've got rid of %README%.
   if [ -n "$SKIP" ]; then
     if [ "$SKIP" != 'no' ]; then
       STATUS[$itemid]="skipped"
