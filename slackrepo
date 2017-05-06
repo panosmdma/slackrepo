@@ -70,6 +70,7 @@ function exit_cleanup
     ${SUDO}umount -l "$MYTMP" 2>/dev/null || true
     rmdir --ignore-fail-on-non-empty "$MYTMP"
   fi
+  [ -n "$BIGTMP" ] && rm -rf "$BIGTMP"
   exit ${1:-0}
 }
 
@@ -105,7 +106,8 @@ OPTIONLIST=( 'REPO' 'VERBOSE' 'VERY_VERBOSE' \
   'DRY_RUN' 'INSTALL' 'LINT' 'KEEP_TMP' 'CHROOT' 'COLOR' 'NICE' )
 
 # Get the support functions
-for f in /usr/libexec/$(basename "$0")/functions.d/*.sh; do
+LIBEXECDIR="/usr/libexec/$(basename "$0")"
+for f in "${LIBEXECDIR}"/functions.d/*.sh; do
   if [ -x "$f" ]; then
     . "$f"
   fi
@@ -165,10 +167,10 @@ while [ $# != 0 ]; do
       found='n'
       for opt in "${OPTIONLIST[@]}"; do
         arg=$(echo "$opt" | tr '_' '-' | tr '[:upper:]' '[:lower:]')
-        if [ "$1" = "--${arg}" -o "$1" = "--${arg}=yes" -o "$1" = "--${arg}=y" ]; then
+        if [ "$1" = "--${arg}" ] || [ "$1" = "--${arg}=yes" ] || [ "$1" = "--${arg}=y" ]; then
           eval OPT_"${opt}"='y'
           found='y'; break
-        elif [ "$1" = "--no-${arg}" -o "$1" = "--${arg}=no" -o "$1" = "--${arg}=n" ]; then
+        elif [ "$1" = "--no-${arg}" ] || [ "$1" = "--${arg}=no" ] || [ "$1" = "--${arg}=n" ]; then
           eval OPT_"${opt}"='n'
           found='y'; break
         elif [ "${1/=*/=}" = "--${arg}=" ]; then
@@ -216,7 +218,7 @@ if [ "$EUID" != 0 ]; then
     exit_cleanup 3
   fi
   SUDO="/usr/bin/sudo "
-  export PATH="/usr/libexec/$(basename "$0"):/usr/local/sbin:/usr/sbin:/sbin:$PATH"
+  export PATH="${LIBEXECDIR}:/usr/local/sbin:/usr/sbin:/sbin:$PATH"
   # We need to launch a dbus session instance for root outside the chroot, to prevent
   # commands like gconftool-2 (in doinst.sh) launching a dbus in the chroot that
   # would persist after chroot exits and stop us unmounting the overlay (*BIG SIGH*)
@@ -224,7 +226,7 @@ if [ "$EUID" != 0 ]; then
   eval "${dbuscrap}"
 else
   SUDO=''
-  export PATH="/usr/libexec/$(basename "$0"):$PATH"
+  export PATH="${LIBEXECDIR}:$PATH"
   # If there is no existing dbus session instance for root, create one
   if [ -z "$DBUS_SESSION_BUS_ADDRESS" ]; then
     dbuscrap="$(DISPLAY='' dbus-launch --sh-syntax 2>/dev/null)"
@@ -255,7 +257,7 @@ fi
 SYS_KERNEL=$(uname -r)
 SYS_ARCH=$(uname -m)
 SYS_MULTILIB='n'
-[ "$SYS_ARCH" = 'x86_64' -a -f /etc/profile.d/32dev.sh ] && SYS_MULTILIB='y'
+[ "$SYS_ARCH" = 'x86_64' ] && [ -f /etc/profile.d/32dev.sh ] && SYS_MULTILIB='y'
 SYS_NPROC=$(nproc)
 [ -f /proc/cpuinfo ] && SYS_MHz=$(awk '/^cpu MHz/ {sum+=$4} END {print sum}' < /proc/cpuinfo)
 # If that's jiggered (stupid Pi kernels), try this. Then give up like W.C. Fields said.
@@ -264,17 +266,22 @@ SYS_NPROC=$(nproc)
 SYS_OVERLAYFS='n'
 # don't look at the kernel version -- somebody might have the old patchset
 [ -f /lib/modules/"$(uname -r)"/kernel/fs/overlayfs/overlay.ko ] && SYS_OVERLAYFS='y'
+# Detect current
 SYS_CURRENT='n'
-if [ "${SYS_OSNAME}${SYS_OSVER}" = "slackware14.1" ] || [ "${SYS_OSNAME}${SYS_OSVER}" = "slackware14.2" ]; then
-  is_installed "make-3.82-a-bt"
-  iistat=$?
-  if [ "$iistat" = 0 ] || [ "$iistat" = 1 ]; then
-    parse_package_name "$R_INSTALLED"
-    if [ "$PN_VERSION" != 3.82 ] || [ "$PN_BUILD" -ge 5 ]; then
+if [ -f /var/lib/slackpkg/ChangeLog.txt ]; then
+  if ! grep -q "${SYS_OSVER}.*is released" /var/lib/slackpkg/ChangeLog.txt; then
+    # we must be in-between updating aaa_base and the real release
+    SYS_CURRENT='y'
+  fi
+elif [ "${SYS_OSNAME}${SYS_OSVER}" = "slackware14.2" ]; then
+  # file-5.25 was the first package superseded in this cycle of current
+  for filefile in /var/log/packages/file-5.25-*-1; do
+    if [ ! -f "$filefile" ]; then
       SYS_CURRENT='y'
       init_current_pkgs
+      break
     fi
-  fi
+  done
 fi
 
 # Next, do the config variables.
@@ -338,9 +345,9 @@ for name in "${OPTIONLIST[@]}" ; do
   [ -z "${!optvar}" ] && eval "$optvar=\"${!name}\""
   eval unset "$name"
   # simplify anything that looks like a Boolean:
-  if   [ "${!optvar}" = '1' -o "${!optvar}" = 'yes' -o "${!optvar}" = 'y' -o "${!optvar}" = 'YES' -o "${!optvar}" = 'Y' ]; then
+  if   [ "${!optvar}" = '1' ] || [ "${!optvar}" = 'yes' ] || [ "${!optvar}" = 'y' ] || [ "${!optvar}" = 'YES' ] || [ "${!optvar}" = 'Y' ]; then
     eval "$optvar"='y'
-  elif [ "${!optvar}" = '0' -o "${!optvar}" = 'no'  -o "${!optvar}" = 'n' -o "${!optvar}" = 'NO'  -o "${!optvar}" = 'N' -o "${!optvar}" = '' ]; then
+  elif [ "${!optvar}" = '0' ] || [ "${!optvar}" = 'no'  ] || [ "${!optvar}" = 'n' ] || [ "${!optvar}" = 'NO'  ] || [ "${!optvar}" = 'N' ] || [ "${!optvar}" = '' ]; then
     eval "$optvar"='n'
   fi
 done
@@ -361,12 +368,17 @@ fi
 
 # If SR_NUMJOBS or SR_ARCH not set, work them out and set them explicitly
 if [ -z "$SR_NUMJOBS" ]; then
-  SR_NUMJOBS="-j$(( SYS_NPROC + 1 ))"
+  SR_NUMJOBS="-j$(( SYS_NPROC * 2 )) -l$(( SYS_NPROC + 1 ))"
 fi
 # setting ARCH breaks lots of SlackBuilds, which is why we do it ;-)
-if [ -z "$SR_ARCH" -o "$SR_ARCH" = '%ARCH%' ]; then
+if [ -z "$SR_ARCH" ] || [ "$SR_ARCH" = '%ARCH%' ]; then
   case "$SYS_ARCH" in
-    i?86) SR_ARCH='i486' ;;
+    i?86) if [ "$SYS_OSVER" = '14.1' ]; then
+            SR_ARCH='i486'
+          else
+            SR_ARCH='i586'
+          fi
+          ;;
     arm*) SR_ARCH='arm' ;;
        *) SR_ARCH="$SYS_ARCH" ;;
   esac
@@ -435,27 +447,30 @@ SR_LOCATEDB="$(dirname "$SR_DATABASE")/locatedb_${OPT_REPO}"
 # Temporary directory:
 SR_TMP=${SR_TMP:-/tmp/SBo}
 # really really don't want the next bit to go badly ;-)
-if [ -n "$SR_TMP" -a -d "$SR_TMP" -a "$OPT_KEEP_TMP" != 'y' ]; then
+if [ -n "$SR_TMP" ] && [ -d "$SR_TMP" ]; then
   log_normal "Cleaning $SR_TMP ... "
   # remove it completely to avoid ownership and permission problems
   ${SUDO}rm -rf "${SR_TMP:?NotSetSR_TMP}"
   log_done
 fi
-mkdir -p "$SR_TMP"
+mkdir -p "$SR_TMP" || { log_error "Failed to create $SR_TMP"; exit_cleanup 4; }
 
-# We also need a slackrepo-specific temporary directory
+# We need a slackrepo-specific temporary directory, for small stuff only
 MYTMP=$(mktemp -t -d slackrepo.XXXXXX) || { log_error "Failed to create temporary directory"; exit_cleanup 4; }
-# mount a tmpfs on MYTMP: (1) it's fast, (2) we might be in an overlay,
+# Mount a tmpfs on MYTMP: (1) it's fast, (2) we might already be in an overlay,
 # and you can't have upperdir or workdir on an overlay
 ${SUDO}mount -t tmpfs -o defaults,mode=1777 tmpfs "$MYTMP" || { log_error "Failed to mount $MYTMP"; exit_cleanup 4; }
+
+# We need a temporary directory for big stuff too
+BIGTMP=$(mktemp -t -p "$SR_TMP" -d slackrepo.XXXXXX) || { log_error "Failed to create directory in $SR_TMP"; exit_cleanup 4; }
 
 #### Probably should make --keep-tmp force $TMP into $MYTMP
 
 # Disposable package repository for dry run:
 if [ "$OPT_DRY_RUN" = 'y' ]; then
-  DRYREPO="$MYTMP"/dryrun-packages
-  rm -rf "$DRYREPO"
-  mkdir -p "$DRYREPO"
+  TMP_DRYREPO="$BIGTMP"/dryrun-packages
+  rm -rf "$TMP_DRYREPO"
+  mkdir -p "$TMP_DRYREPO"
 fi
 
 #-------------------------------------------------------------------------------
@@ -509,7 +524,7 @@ elif [ "$GOTGIT" = 'y' ] && [ "$CMD" = 'build' ] || [ "$CMD" = 'rebuild' ] || [ 
         git fetch
         db_set_misc "git_fetch_${currbranch}" "$(date +%s)"
         dounbuffer=""
-        [ "$DOCOLOUR"  = 'y' ] && dounbuffer="/usr/libexec/slackrepo/unbuffer "
+        [ "$DOCOLOUR"  = 'y' ] && dounbuffer="${LIBEXECDIR}/unbuffer "
         $dounbuffer git merge --ff-only origin/"$currbranch"
         gitstat=$?
       fi
@@ -556,7 +571,7 @@ if [ -s "$CHANGELOG" ]; then
   log_important "Continuing changelog from previous run."
 else
   mkdir -p "$(dirname "$CHANGELOG")"
-  > "$CHANGELOG"
+  true > "$CHANGELOG"
 fi
 
 declare -A KEEPINSTALLED
@@ -688,7 +703,7 @@ fi
 #-------------------------------------------------------------------------------
 
 genrepstat=0
-if [ "$OPT_DRY_RUN" != 'y' -a -s "$CHANGELOG" ]; then
+if [ "$OPT_DRY_RUN" != 'y' ] && [ -s "$CHANGELOG" ]; then
   if [ "$SR_USE_GENREPOS" = 1 ]; then
     if [ -z "$SR_RSS_UUID" ]; then
       log_error "Please set RSS_UUID in $repoconf"
@@ -702,7 +717,7 @@ if [ "$OPT_DRY_RUN" != 'y' -a -s "$CHANGELOG" ]; then
       RSS_DESCRIPTION="$SR_RSS_DESCRIPTION" RSS_FEEDMAX="$SR_RSS_FEEDMAX" RSS_UUID="$SR_RSS_UUID" \
       GPGBIN="$SR_GPGBIN" USE_GPGAGENT="$SR_USE_GPGAGENT" FOR_SLAPTGET="$SR_FOR_SLAPTGET" \
       FOLLOW_SYMLINKS="$SR_FOLLOW_SYMLINKS" REPO_SUBDIRS="$SR_REPO_SUBDIRS" \
-      sh /usr/libexec/"$(basename "$0")"/gen_repos_files.sh -l "$CHANGELOG"
+      sh "${LIBEXECDIR}"/gen_repos_files.sh -l "$CHANGELOG"
       genrepstat=$?
       [ "$genrepstat" != 0 ] && log_error "gen_repos_files.sh failed -- changelog retained"
       log_normal ""

@@ -292,7 +292,7 @@ function calculate_item_status
 
   # Package dir not in either repo => add
   if [ ! -d "$SR_PKGREPO"/"$itemdir" ]; then
-    if [ -z "$DRYREPO" ] || [ ! -d "$DRYREPO"/"$itemdir" ]; then
+    if [ -z "$TMP_DRYREPO" ] || [ ! -d "$TMP_DRYREPO"/"$itemdir" ]; then
       STATUS[$itemid]="add"
       STATUSINFO[$itemid]="add version ${HINT_VERSION[$itemid]:-${INFOVERSION[$itemid]}}"
     fi
@@ -303,7 +303,7 @@ function calculate_item_status
   pkglist=( "$SR_PKGREPO"/"$itemdir"/*.t?z )   ####
   if [ ! -f "${pkglist[0]}" ]; then
     # Nothing in the main repo, so look in dryrun repo
-    pkglist=( "$DRYREPO"/"$itemdir"/*.t?z )    ####
+    pkglist=( "$TMP_DRYREPO"/"$itemdir"/*.t?z )    ####
     if [ ! -f "${pkglist[0]}" ]; then
       STATUS[$itemid]="add"
       STATUSINFO[$itemid]="add version ${HINT_VERSION[$itemid]:-${INFOVERSION[$itemid]}}"
@@ -339,7 +339,7 @@ function calculate_item_status
 
     # If the git rev has changed => update
     if [ "$pkgrev" != "$currrev" ]; then
-      if [ "${GITDIRTY[$itemid]}" != 'y' -a "${pkgrev/*+/+}" != '+dirty' ]; then
+      if [ "${GITDIRTY[$itemid]}" != 'y' ] && [ "${pkgrev/*+/+}" != '+dirty' ]; then
         # if only README, slack-desc and .info have changed, don't build
         # (the VERSION in the .info file has already been checked ;-)
         modifilelist=( $(cd "$SR_SBREPO"; git diff --name-only "$pkgrev" "$currrev" -- "$itemdir" 2>/dev/null) )
@@ -467,7 +467,7 @@ function write_pkg_metadata
   #-----------------------------#
 
   myrepo="$SR_PKGREPO"
-  [ "$OPT_DRY_RUN" = 'y' ] && myrepo="$DRYREPO"
+  [ "$OPT_DRY_RUN" = 'y' ] && myrepo="$TMP_DRYREPO"
   pkglist=( "$myrepo"/"$itemdir"/*.t?z )
 
   operation="$(echo "${STATUSINFO[$itemid]}" | sed -e 's/^add/Added/' -e 's/^updated + //' -e 's/^update /Updated /' -e 's/^rebuild/Rebuilt/' )"
@@ -557,7 +557,7 @@ EOF
         tar xf "$pkgpath" -O install/slack-desc 2>/dev/null | sed -n '/^#/d;/:/p' > "$dottxt"
       else
         # bad egg!
-        > "$dottxt"
+        true > "$dottxt"
       fi
     fi
 
@@ -582,8 +582,8 @@ EOF
 
         # slack-required
         # from packaging dir, or extract from package, or synthesise it from DIRECTDEPS
-        if [ -f "$TMP"/package-"$pkgnam"/install/slack-required ]; then
-          SLACKREQUIRED=$(tr -d ' ' < "$TMP"/package-"$pkgnam"/install/slack-required | xargs -r -iZ echo -n "Z," | sed -e "s/,$//")
+        if [ -f "$SR_TMP"/package-"$pkgnam"/install/slack-required ]; then
+          SLACKREQUIRED=$(tr -d ' ' < "$SR_TMP"/package-"$pkgnam"/install/slack-required | xargs -r -iZ echo -n "Z," | sed -e "s/,$//")
         elif grep -q install/slack-required "$dotlst"; then
           SLACKREQUIRED=$(tar xf "$pkgpath" -O install/slack-required 2>/dev/null | tr -d ' ' | xargs -r -iZ echo -n "Z," | sed -e "s/,$//")
         elif [ -n "${DIRECTDEPS[$itemid]}" ]; then
@@ -595,8 +595,8 @@ EOF
 
         # slack-conflicts
         # from packaging dir, or extract from package, or get it from the hintfile
-        if [ -f "$TMP"/package-"$pkgnam"/install/slack-conflicts ]; then
-          SLACKCONFLICTS=$(tr -d ' ' < "$TMP"/package-"$pkgnam"/install/slack-conflicts | xargs -r -iZ echo -n "Z," | sed -e "s/,$//")
+        if [ -f "$SR_TMP"/package-"$pkgnam"/install/slack-conflicts ]; then
+          SLACKCONFLICTS=$(tr -d ' ' < "$SR_TMP"/package-"$pkgnam"/install/slack-conflicts | xargs -r -iZ echo -n "Z," | sed -e "s/,$//")
         elif grep -q install/slack-conflicts "$dotlst"; then
           SLACKCONFLICTS=$(tar xf "$pkgpath" -O install/slack-conflicts 2>/dev/null | tr -d ' ' | xargs -r -iZ echo -n "Z," | sed -e "s/,$//")
         elif [ -n "${HINT_CONFLICTS[$itemid]}" ]; then
@@ -608,8 +608,8 @@ EOF
 
         # slack-suggests
         # from packaging dir, or extract from package
-        if [ -f "$TMP"/package-"$pkgnam"/install/slack-suggests ]; then
-          SLACKSUGGESTS=$(tr -d ' ' < "$TMP"/package-"$pkgnam"/install/slack-suggests | xargs -r -iZ echo -n "Z," | sed -e "s/,$//")
+        if [ -f "$SR_TMP"/package-"$pkgnam"/install/slack-suggests ]; then
+          SLACKSUGGESTS=$(tr -d ' ' < "$SR_TMP"/package-"$pkgnam"/install/slack-suggests | xargs -r -iZ echo -n "Z," | sed -e "s/,$//")
         elif grep -q install/slack-suggests "$dotlst"; then
           SLACKCONFLICTS=$(tar xf "$pkgpath" -O install/slack-suggests 2>/dev/null | tr -d ' ' | xargs -r -iZ echo -n "Z," | sed -e "s/,$//")
         else
@@ -647,7 +647,7 @@ EOF
     # gen_repos_files.sh will do it later :-)
 
     # Finally, we can get rid of this:
-    [ "$OPT_KEEP_TMP" != 'y' ] && rm -f "$MY_PKGCONTENTS"
+    rm -f "$MY_PKGCONTENTS"
 
   done
 

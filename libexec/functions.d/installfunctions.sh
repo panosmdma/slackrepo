@@ -83,9 +83,9 @@ function install_packages
       local -a pkgnams=( $(db_get_itemid_pkgnams "$itemid") )
       local -a pkglist=()
       for pn in "${pkgnams[@]}"; do
-        # Don't look in MYTMPOUT (if you want that, specify them as pathnames)
+        # Don't look in TMP_OUTPUT (if you want that, specify them as pathnames)
         if [ "$OPT_DRY_RUN" = 'y' ]; then
-          for p in "$DRYREPO"/"$itemdir"/"${pn}"-*.t?z; do
+          for p in "$TMP_DRYREPO"/"$itemdir"/"${pn}"-*.t?z; do
             if [ -e "$p" ]; then
               # cross-check p's pkgnam against pn (e.g. the geany/geany-plugins problem)
               ppb="${p##*/}"
@@ -138,7 +138,7 @@ function install_packages
       elif [ "$istat" = 2 ]; then
         # nothing similar currently installed
         set -o pipefail
-        ROOT=${CHROOTDIR:-/} ${SUDO}installpkg --terse "$pkgpath" 2>&1 | tee -a "$MAINLOG" "$ITEMLOG"
+        ROOT=${MY_CHRDIR:-/} ${SUDO}installpkg --terse "$pkgpath" 2>&1 | tee -a "$MAINLOG" "$ITEMLOG"
         pstat=$?
         set +o pipefail
         [ "$pstat" = 0 ] || { log_error -a "${itemid}: installpkg $pkgbase failed (status $pstat)"; return 1; }
@@ -151,11 +151,11 @@ function install_packages
         [ "$istat" = 3 ] && log_warning -n "Attempting to upgrade or reinstall $R_INSTALLED ..."
         if [ "$OPT_VERBOSE" = 'y' ]; then
           set -o pipefail
-          ROOT=${CHROOTDIR:-/} ${SUDO}upgradepkg --reinstall "$pkgpath" 2>&1 | tee -a "$ITEMLOG"
+          ROOT=${MY_CHRDIR:-/} ${SUDO}upgradepkg --reinstall "$pkgpath" 2>&1 | tee -a "$ITEMLOG"
           pstat=$?
           set +o pipefail
         else
-          ROOT=${CHROOTDIR:-/} ${SUDO}upgradepkg --reinstall "$pkgpath" >> "$ITEMLOG" 2>&1
+          ROOT=${MY_CHRDIR:-/} ${SUDO}upgradepkg --reinstall "$pkgpath" >> "$ITEMLOG" 2>&1
           pstat=$?
         fi
         [ "$pstat" = 0 ] || { log_error -a "${itemid}: upgradepkg $pkgbase failed (status $pstat)"; return 1; }
@@ -213,7 +213,7 @@ function uninstall_packages
   fi
 
   # Don't remove a package that has an install hint, unless -f was specified.
-  [ "${HINT_INSTALL[$itemid]}" = 'y' -a "$force" != 'y' ] && return 0
+  [ "${HINT_INSTALL[$itemid]}" = 'y' ] && [ "$force" != 'y' ] && return 0
 
   # Look for the package(s).
   pkgnams=( $(db_get_itemid_pkgnams "$itemid") )
@@ -227,22 +227,22 @@ function uninstall_packages
       continue
     else
       # Don't remove a package flagged with KEEPINSTALLED, unless -f was specified.
-      [ -n "${KEEPINSTALLED[$pkgnam]}" -a "$force" != 'y' ] && continue
+      [ -n "${KEEPINSTALLED[$pkgnam]}" ] && [ "$force" != 'y' ] && continue
 
       if [ "$OPT_INSTALL" = 'y' ] || [ -n "${KEEPINSTALLED[$pkgnam]}" ] || \
          [ "$force" = 'y' ] || [ "${HINT_INSTALL[$itemid]}" = 'y' ]; then
         # Conventional gentle removepkg :-)
         log_normal -a "Uninstalling $R_INSTALLED ..."
-        ROOT=${CHROOTDIR:-/} ${SUDO}removepkg "$R_INSTALLED" >> "$ITEMLOG" 2>&1
+        ROOT=${MY_CHRDIR:-/} ${SUDO}removepkg "$R_INSTALLED" >> "$ITEMLOG" 2>&1
       else
         # Violent removal :D
         # Save a list of potential detritus in /etc
-        etcnewfiles=$(grep '^etc/.*\.new$' "${CHROOTDIR}"/var/log/packages/"$R_INSTALLED")
-        etcdirs=$(grep '^etc/.*/$' "${CHROOTDIR}"/var/log/packages/"$R_INSTALLED")
+        etcnewfiles=$(grep '^etc/.*\.new$' "${MY_CHRDIR}"/var/log/packages/"$R_INSTALLED")
+        etcdirs=$(grep '^etc/.*/$' "${MY_CHRDIR}"/var/log/packages/"$R_INSTALLED")
         # Run removepkg
         #### if verbose, maybe we should show this on the console, but it's usually big and annoying
         log_normal -a "Uninstalling $R_INSTALLED ..."
-        ROOT=${CHROOTDIR:-/} ${SUDO}removepkg "$R_INSTALLED" >> "$ITEMLOG" 2>&1
+        ROOT=${MY_CHRDIR:-/} ${SUDO}removepkg "$R_INSTALLED" >> "$ITEMLOG" 2>&1
         # Remove any surviving detritus (we now keep files without .new because
         # of openrc and inittab, but overlayfs is the real long-term solution)
         for etcnewfile in $etcnewfiles; do
@@ -301,8 +301,8 @@ function is_installed
   local pkgid="${pkgbase%.t?z}"
   local pkgnam="${pkgbase%-*-*-*}"
   R_INSTALLED=''
-  if ls "${CHROOTDIR}"/var/log/packages/"$pkgnam"-* 1>/dev/null 2>/dev/null; then
-    for instpkg in "${CHROOTDIR}"/var/log/packages/"$pkgnam"-*; do
+  if ls "${MY_CHRDIR}"/var/log/packages/"$pkgnam"-* 1>/dev/null 2>/dev/null; then
+    for instpkg in "${MY_CHRDIR}"/var/log/packages/"$pkgnam"-*; do
       instid="${instpkg##*/}"
       instnam="${instid%-*-*-*}"
       if [ "$instnam" = "$pkgnam" ]; then
@@ -336,15 +336,15 @@ function dotprofilizer
   local pkgpath="$1"
   local varlogpkg script
   # examine /var/log/packages/xxxx because it's quicker than looking inside a .t?z
-  varlogpkg="${CHROOTDIR}"/var/log/packages/$(basename "${pkgpath/%.t?z/}")
+  varlogpkg="${MY_CHRDIR}"/var/log/packages/$(basename "${pkgpath/%.t?z/}")
   if grep -q -E '^etc/profile\.d/.*\.sh(\.new)?' "$varlogpkg"; then
     while read script; do
-      if [ -f "${CHROOTDIR}"/"$script" ]; then
+      if [ -f "${MY_CHRDIR}"/"$script" ]; then
         log_info -a "  Running profile script: /$script"
-        . "${CHROOTDIR}"/"$script"
-      elif [ -f "${CHROOTDIR}"/"$script".new ]; then
+        . "${MY_CHRDIR}"/"$script"
+      elif [ -f "${MY_CHRDIR}"/"$script".new ]; then
         log_info -a "  Running profile script: /$script.new"
-        . "${CHROOTDIR}"/"$script".new
+        . "${MY_CHRDIR}"/"$script".new
       fi
     done < <(grep '^etc/profile\.d/.*\.sh' "$varlogpkg" | sed 's/.new$//')
   fi

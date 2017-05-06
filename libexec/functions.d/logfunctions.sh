@@ -26,6 +26,9 @@
 #   changelog
 #   errorscan_itemlog
 #   format_left_right
+# Monitoring:
+#   resource_monitor
+#   resource_report
 #-------------------------------------------------------------------------------
 
 # Globals:
@@ -343,8 +346,8 @@ function init_colour
 # 1 = 405 lines
 {
   DOCOLOUR='n'
-  [ "$OPT_COLOR" = 'always'       ] && DOCOLOUR='y'
-  [ "$OPT_COLOR" = 'auto' -a -t 1 ] && DOCOLOUR='y'
+  [ "$OPT_COLOR" = 'always' ] && DOCOLOUR='y'
+  [ "$OPT_COLOR" = 'auto' ] && [ -t 1 ] && DOCOLOUR='y'
   if [ "$DOCOLOUR" = 'n' ]; then
     colour_error=""
     colour_warning=""
@@ -458,5 +461,53 @@ function format_left_right
   # If llen is too short, increase the padding:
   [ $(( llen + plen + rlen )) -lt "$LINEWIDTH" ] && plen=$(( LINEWIDTH - llen - rlen ))
   echo $llen $plen $rlen
+  return 0
+}
+
+#-------------------------------------------------------------------------------
+
+function resource_monitor
+# Log disk, memory and load average until killed
+# $1 = pathname of the log file
+# $2 = logging interval in seconds, default 10
+# $BUILDSTARTTIME should have been set by the caller
+{
+  resourcelog="$1"
+  sleepsecs="${2:-10}"
+  printf '%10s %10s %10s %10s\n' elapsed loadavg memused tmpused > "$resourcelog"
+  [ -z "$BUILDSTARTTIME" ] && BUILDSTARTTIME="$(date '+%s')"
+  while true; do
+    elapsed=$(( $(date '+%s') - BUILDSTARTTIME ))
+    loadavg=$(cut -f1 -d' ' < /proc/loadavg)
+    memused=$(awk '/MemTotal:/ {mt=$2} /MemAvailable:/ {ma=$2} END {print mt-ma}' /proc/meminfo)
+    bigtmp=$(df "$BIGTMP" --output=used | tail -n +2)
+    printf '%10s %10s %10s %10s\n' "$elapsed" "$loadavg" "$memused" "$bigtmp" >> "$resourcelog"
+    sleep "$sleepsecs"
+  done
+}
+
+#-------------------------------------------------------------------------------
+
+function resource_report
+# Log peak disk, memory and load average from the resource log file
+# (obviously, depending on other activity, these numbers may be completely bogus)
+# Don't report if the build lasted less than 60 sec
+# $1 = pathname of the resource log file
+# $BUILDELAPSED should have been set by the caller
+{
+  resourcelog="$1"
+  read lavgpeak mempeak tmppeak < <(tail -n +2 "$resourcelog" | \
+    awk '{ linect+=1;
+           if ($2 > lmax) lmax=$2;
+           if ($3 > mmax) mmax=$3; if (linect == 1) mstart=$3;
+           if ($4 > tmax) tmax=$4; if (linect == 1) tstart=$4; }
+         END {print lmax,(mmax-mstart)/1024,(tmax-tstart)/1024}')
+  if [ -n "$lavgpeak" ] && [ -n "$BUILDELAPSED" ]; then
+    if [ "$BUILDELAPSED" -ge 600 ]; then
+      log_info -a "Build time $(( BUILDELAPSED / 60 )) min, peak load $lavgpeak, peak memory ${mempeak%.*}M, peak tmp ${tmppeak%.*}M"
+    elif [ "$BUILDELAPSED" -ge 60 ]; then
+      log_info -a "Build time $BUILDELAPSED sec, peak load $lavgpeak, peak memory ${mempeak%.*}M, peak tmp ${tmppeak%.*}M"
+    fi
+  fi
   return 0
 }
