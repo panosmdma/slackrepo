@@ -242,10 +242,12 @@ function build_item_packages
       sed -i -e "s/make test/: # make test/" "$TMP_SLACKBUILD"/"$itemfile"
       ;;
     'x86arch'* )
-      fixarch="${pragma/x86arch=/}"
-      log_info -a "Pragma: ${pragma}"
-      sed -i -e "s/^PRGNAM=.*/&; ARCH='$fixarch'/" "$TMP_SLACKBUILD"/"$itemfile"
-      unset ARCH
+      if [ "$SR_ARCH" = 'i486' ] || [ "$SR_ARCH" = 'i586' ] || [ "$SR_ARCH" = 'i686' ]; then
+        log_info -a "Pragma: ${pragma}"
+        fixarch="${pragma/x86arch=/}"
+        sed -i -e "s/^PRGNAM=.*/&; ARCH='$fixarch'/" "$TMP_SLACKBUILD"/"$itemfile"
+        unset ARCH
+      fi
       ;;
     'noexport_ARCH' )
       log_info -a "Pragma: noexport_ARCH"
@@ -674,7 +676,7 @@ function chroot_setup
   OVL_WORK="$TMP_OVLDIR"/work
   ${SUDO}mkdir -p "$OVL_DIRTY" "$OVL_WORK"
   ${SUDO}mount -t overlay overlay -olowerdir=/,upperdir="$OVL_DIRTY",workdir="$OVL_WORK" "$MY_CHRDIR" || \
-    { log_error "Failed to mount $MY_CHRDIR"; exit_cleanup 5; }
+    { log_error "Failed to mount $MY_CHRDIR"; exit_cleanup 6; }
   CHRMOUNTS+=( "$MY_CHRDIR" )
 
   # Setup a chroot environment with all the trimmings
