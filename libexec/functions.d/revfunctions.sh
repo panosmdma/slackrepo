@@ -102,11 +102,11 @@ function calculate_deps_and_status
 
   # These variables are used both here and in calculate_item_status.
   # This isn't terribly efficient, but at least db_get_rev has a cache.
-  local pkgdeps pkgver pkgblt pkgrev pkgos pkghnt
-  read  pkgdeps pkgver pkgblt pkgrev pkgos pkghnt < <(db_get_rev "$itemid")
-  local pardeps parver parblt parrev paros parhnt
+  local     pkgdeps pkgver pkgblt pkgrev pkgos pkghnt
+  read -r   pkgdeps pkgver pkgblt pkgrev pkgos pkghnt < <(db_get_rev "$itemid")
+  local     pardeps parver parblt parrev paros parhnt
   if [ -n "$parentid" ]; then
-    read pardeps parver parblt parrev paros parhnt < <(db_get_rev "$parentid" "$itemid")
+    read -r pardeps parver parblt parrev paros parhnt < <(db_get_rev "$parentid" "$itemid")
   fi
 
   # Examine the current item
@@ -456,7 +456,7 @@ function write_pkg_metadata
   else
     currentrevinfo="$(print_current_revinfo "$itemid")"
     db_del_rev "$itemid"
-    echo "$currentrevinfo" | while read revinfo; do
+    echo "$currentrevinfo" | while read -r revinfo; do
       db_set_rev $revinfo
     done
   fi
@@ -505,7 +505,6 @@ function write_pkg_metadata
     # but the .md5, .sha256 and .asc filenames include the suffix:
     dotmd5="${pkgpath}.md5"
     dotsha256="${pkgpath}.sha256"
-    dotasc="${pkgpath}.asc"
 
     # Although gen_repos_files.sh can create most of the following files,
     # it's quicker to create them here (we can probably get the slack-desc from the

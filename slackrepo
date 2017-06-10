@@ -45,6 +45,7 @@ function print_usage
   echo 'Control args:'
   echo '  --repo=ID'
   echo '  --verbose (-v)'
+  echo '  --debug (-d)'
   echo '  --dry-run | --install'
   echo '  --lint'
   echo '  --keep-tmp'
@@ -167,6 +168,12 @@ while [ $# != 0 ]; do
       shift; continue ;;
     --very-verbose | -vv )
       OPT_VERY_VERBOSE='y'
+      shift; continue ;;
+    --debug | -d )
+      OPT_VERY_VERBOSE='y'
+      OPT_DRY_RUN='y'
+      OPT_LINT='y'
+      OPT_KEEP_TMP='y'
       shift; continue ;;
     --color=* | --colour=* )
       OPT_COLOR="${1/--colo*r=/}"
@@ -425,7 +432,7 @@ if [ $? != 0 ]; then
 fi
 
 # Arrays for tracking outcomes:
-declare -a OKLIST WARNINGLIST SKIPPEDLIST FAILEDLIST ABORTEDLIST BADLIST
+declare -a OKLIST WARNINGLIST SKIPPEDLIST FAILEDLIST ABORTEDLIST
 
 # Create directories:
 [ -d "$SR_SBREPO" ]   || \
@@ -448,8 +455,6 @@ declare -a OKLIST WARNINGLIST SKIPPEDLIST FAILEDLIST ABORTEDLIST BADLIST
 # This is now *required* so here is a default path:
 [ -n "$SR_DATABASE" ] || SR_DATABASE="$(dirname "$SR_SBREPO")/database_${OPT_REPO}.sqlite3"
 db_init || { log_error "Failed to initialise database"; exit_cleanup 4; }
-# we'll also have a locatedb (findutils) database in the same place:
-SR_LOCATEDB="$(dirname "$SR_DATABASE")/locatedb_${OPT_REPO}"
 
 # Temporary directory:
 SR_TMP=${SR_TMP:-/tmp/SBo}
@@ -698,7 +703,7 @@ if [ "$abortedcount" != 0 ]; then
 fi
 # Don't bother enumerating 'bad' items (not found, etc)
 uniquewarnings=()
-[ "${#WARNINGLIST[@]}" != 0 ] && while read warning; do uniquewarnings+=( "$warning" ); done < <(printf '%s\n' "${WARNINGLIST[@]}" | sort -u )
+[ "${#WARNINGLIST[@]}" != 0 ] && while read -r warning; do uniquewarnings+=( "$warning" ); done < <(printf '%s\n' "${WARNINGLIST[@]}" | sort -u )
 warningcount="${#uniquewarnings[@]}"
 if [ "$warningcount" != 0 ]; then
   log_normal "Warnings:    $warningcount"
