@@ -16,7 +16,7 @@ function build_command
 # Build an item and all its dependencies
 # $1 = itemid
 # Return status:
-# 0 = build ok, or already up-to-date so not built, or dry run
+# 0 = build ok, or already up-to-date so not built, or preview, or dry run
 # 1 = build failed, or sub-build failed => abort parent, or any other error
 {
   [ -z "$1" ] && return 1
@@ -54,10 +54,41 @@ function build_command
     fi
   fi
 
+  if [ "${OPT_PREVIEW}" = 'y' ]; then
+    case "${STATUS[$itemid]}" in
+      ok)
+        log_important "$itemid is up-to-date (version ${INFOVERSION[$itemid]})." ;;
+      add)
+        log_important "$itemid would be added (version ${INFOVERSION[$itemid]})." ;;
+      update)
+        log_important "$itemid would be updated (version ${INFOVERSION[$itemid]})." ;;
+      rebuild)
+        log_important "$itemid would be rebuilt (version ${INFOVERSION[$itemid]})." ;;
+      remove)
+        log_important "$itemid would be removed (version ${INFOVERSION[$itemid]})." ;;
+      skipped)
+        log_important "$itemid would not be built." ;;
+      aborted|unsupported)
+        log_important "$itemid can not be built." ;;
+      *)
+        : ;;
+    esac
+    log_normal ""
+    return 0
+  fi
+
   if [ "${#TODOLIST[@]}" = 0 ]; then
     # Nothing is going to be built.  Log the final outcome.
     if [ "${STATUS[$itemid]}" = 'ok' ]; then
+      # we still need to process --install
       log_important "$itemid is up-to-date (version ${INFOVERSION[$itemid]})."
+      if [ "${HINT_INSTALL[$itemid]}" = 'y' ] || [ "$OPT_INSTALL" = 'y' -a "${HINT_INSTALL[$itemid]}" != 'n' ]; then
+        log_normal ""
+        CMD='install' log_itemstart "$itemid" "Installing $itemid"
+        install_deps "$itemid" || { log_error "Failed to install dependencies of $itemid"; return 1; }
+        install_packages "$itemid" || { log_error "Failed to install $itemid"; return 1; }
+        log_important "Installing finished."
+      fi
     elif [ "${STATUS[$itemid]}" = 'removed' ]; then
       log_important "$itemid has been removed."
     elif [ "${STATUS[$itemid]}" = 'skipped' ]; then
@@ -71,7 +102,7 @@ function build_command
       log_error "Cannot build ${itemid}."
       [ -n "${STATUSINFO[$itemid]}" ] && log_normal "${STATUSINFO[$itemid]}"
     else
-      log_warning "$itemid has unexpected status ${STATUS[$itemid]}"
+      log_warning -n "$itemid has unexpected status ${STATUS[$itemid]}"
     fi
     log_normal ""
   else
@@ -94,7 +125,7 @@ function build_command
         missingdeps=()
         for dep in ${DIRECTDEPS[$todo]}; do
           if [ "${STATUS[$dep]}" != 'ok' ] && [ "${STATUS[$dep]}" != 'updated' ]; then
-           missingdeps+=( "$dep" )
+            missingdeps+=( "$dep" )
           fi
         done
         if [ "${#missingdeps[@]}" = '0' ]; then
@@ -182,6 +213,8 @@ function revert_command
   # Check that there is something to revert.
   extramsg=''
   [ "$OPT_DRY_RUN" = 'y' ] && extramsg="[dry run]"
+  # preview is the same as dry run
+  [ "$OPT_PREVIEW" = 'y' ] && extramsg="[preview]" && OPT_DRY_RUN='y'
   if [ -z "$SR_PKGBACKUP" ]; then
     log_error "No backup repository configured -- please set PKGBACKUP in your config file"
     log_itemfinish "$itemid" 'failed' "$extramsg"
@@ -207,7 +240,7 @@ function revert_command
       else
         deprevdata=( $(db_get_rev "${b_depid}") )
         if [ "${deprevdata[2]:-0}" -gt "$mybuildtime" ]; then
-          log_warning "${b_depid} may need to be reverted"
+          log_warning -s "${b_depid} may need to be reverted"
         fi
       fi
     done < "$backuprevfile"
@@ -219,7 +252,7 @@ function revert_command
   # Log a warning about any dependers
   dependers=$(db_get_dependers "$itemid")
   for depender in $dependers; do
-    log_warning "$depender may need to be rebuilt or reverted"
+    log_warning -s "$depender may need to be rebuilt or reverted"
   done
   # Log a warning about any packages that are installed
   packagelist=( "$packagedir"/*.t?z )
@@ -228,7 +261,7 @@ function revert_command
       is_installed "$pkg"
       istat=$?
       if [ "$istat" = 0 ] || [ "$istat" = 1 ]; then
-        log_warning "$R_INSTALLED is installed, use removepkg to uninstall it"
+        log_warning -s "$R_INSTALLED is installed, use removepkg to uninstall it"
       fi
     done
   fi
@@ -342,11 +375,13 @@ function remove_command
     # Log a warning about any dependers, unless this is happening within another item
     dependers=$(db_get_dependers "$itemid")
     for depender in $dependers; do
-      log_warning "$depender may need to be removed or rebuilt"
+      log_warning -s "$depender may need to be removed or rebuilt"
     done
   else
     removeopt=''
     [ "$OPT_DRY_RUN" = 'y' ] && removeopt=' [dry run]'
+    # preview is the same as dry run
+    [ "$OPT_PREVIEW" = 'y' ] && removeopt=" [preview]" && OPT_DRY_RUN='y'
     log_itemstart "$itemid" "Removing $itemid$removeopt"
   fi
   # Log a comment if the packages don't exist
@@ -359,7 +394,7 @@ function remove_command
     is_installed "$pkg"
     istat=$?
     if [ "$istat" = 0 ] || [ "$istat" = 1 ]; then
-      log_warning "$R_INSTALLED is installed, use removepkg to uninstall it"
+      log_warning -s "$R_INSTALLED is installed, use removepkg to uninstall it"
     fi
   done
 
@@ -440,9 +475,9 @@ function remove_command
         srcfile="$(basename "$srcpath")"
         if [ "$OPT_DRY_RUN" != 'y' ]; then
           rm -f "$srcpath"
-          log_normal "Source file $srcfile has been removed"
+          [ "$srcfile" != '.version' ] && log_normal "Source file $srcfile has been removed"
         else
-          log_normal "Source file $srcfile would be removed"
+          [ "$srcfile" != '.version' ] && log_normal "Source file $srcfile would be removed"
         fi
       done
     elif [ -d "$allsourcedir" ]; then
@@ -450,9 +485,9 @@ function remove_command
         srcfile="$(basename "$srcpath")"
         if [ "$OPT_DRY_RUN" != 'y' ]; then
           rm -f "$srcpath"
-          log_normal "Source file $srcfile has been removed"
+          [ "$srcfile" != '.version' ] && log_normal "Source file $srcfile has been removed"
         else
-          log_normal "Source file $srcfile would be removed"
+          [ "$srcfile" != '.version' ] && log_normal "Source file $srcfile would be removed"
         fi
       done
     fi
@@ -506,57 +541,39 @@ function lint_command
     return 0
   fi
 
-  test_slackbuild "$itemid"
-  tsbstat=$?
+  tsbstat=0
+  if [ "${OPT_LINT_SB:-y}" = 'y' ]; then
+    test_slackbuild "$itemid"
+    tsbstat=$?
+  fi
 
   tdlstat=0
-  verify_src "$itemid" "log_important"
-  case $? in
-    0)  # already got source, and it's good
-        test_download "$itemid"
-        tdlstat=$?
-        ;;
-    1|2|3)
-        # already got source but it's bad, or not got source => get it and try again
-        download_src "$itemid"
-        if [ "$?" = 0 ]; then
-          verify_src "$itemid" "log_warning"
-          [ $? != 0 ] && tdlstat=1
-        else
-          tdlstat=1
-        fi
-        ;;
-    4)
-        # version mismatch: we don't know the md5sums for the old source, and
-        # we don't want to replace the old source with the new source, so we
-        # can't do the test.
-        log_important -a "Source is out-of-date."
-        ;;
-    5|6)
-        # unsupported/untested/nodownload (actually, unsupported/untested was
-        # filtered out earlier, so this is really just nodownload)
-        :
-        ;;
-  esac
+  if [ "${OPT_LINT_DL:-y}" = 'y' ]; then
+    test_download "$itemid"
+    tdlstat=$?
+  fi
 
-  tpkstat=0
-  pstat=''
-  for pkgnam in $(db_get_itemid_pkgnams "$itemid"); do
-    pkgpathlist=( "${SR_PKGREPO}"/"$itemdir"/"$pkgnam"-*-*-*.t?z )
-    for pkgpath in "${pkgpathlist[@]}"; do
-      if [ -f "$pkgpath" ]; then
-        test_package -n "$itemid" "$pkgpath"
-        pstat=$?
-        [ $pstat -gt $tpkstat ] && tpkstat=$pstat
-      fi
+  tpkgstat=0
+  if [ "${OPT_LINT_PKG:-y}" = 'y' ]; then
+    pstat=''
+    for pkgnam in $(db_get_itemid_pkgnams "$itemid"); do
+      pkgpathlist=( "${SR_PKGREPO}"/"$itemdir"/"$pkgnam"-*-*-*.t?z )
+      for pkgpath in "${pkgpathlist[@]}"; do
+        if [ -f "$pkgpath" ]; then
+          # Note, we can't test-install a package without its deps, so we don't use 'test_package -i'
+          test_package "$itemid" "$pkgpath"
+          pstat=$?
+          [ "$pstat" -gt "$tpkgstat" ] && tpkgstat="$pstat"
+        fi
+      done
     done
-  done
-  [ -z "$pstat" ] && log_important -a "No packages found."
+    [ -z "$pstat" ] && log_important -a "No packages found."
+  fi
 
   log_normal -a ""
-  if [ "$tsbstat" = 0 ] && [ "$tdlstat" = 0 ] && [ "$tpkstat" = 0 ]; then
+  if [ "$tsbstat" = 0 ] && [ "$tdlstat" = 0 ] && [ "$tpkgstat" = 0 ]; then
     log_itemfinish "$itemid" "ok" "lint OK"
-  elif [ "$tsbstat" -le 1 ] && [ "$tdlstat" -le 1 ] && [ "$tpkstat" -le 1 ]; then
+  elif [ "$tsbstat" -le 1 ] && [ "$tdlstat" -le 1 ] && [ "$tpkgstat" -le 1 ]; then
     log_itemfinish "$itemid" "warning" "lint completed with warnings"
   else
     log_itemfinish "$itemid" "failed" "lint"
@@ -610,13 +627,16 @@ function info_command
   elif [ "$OPT_VERBOSE" = 'y' ]; then
     echo "  --verbose"
   fi
+  [      "$OPT_PREVIEW" = 'y' ] && echo "  --preview"
   [      "$OPT_DRY_RUN" = 'y' ] && echo "  --dry-run"
   [      "$OPT_INSTALL" = 'y' ] && echo "  --install"
-  [         "$OPT_LINT" = 'y' ] && echo "  --lint"
+  [        "$OPT_LINT" != 'n' ] && echo "  --lint=$OPT_LINT"
   [     "$OPT_KEEP_TMP" = 'y' ] && echo "  --keep-tmp"
-  [       "$OPT_CHROOT" = 'y' ] && echo "  --chroot"
+  [      "$OPT_CHROOT" != 'n' ] && echo "  --chroot=$OPT_CHROOT"
   [    "$OPT_COLOR" != 'auto' ] && echo "  --color=$OPT_COLOR"
   [        "$OPT_NICE" != '5' ] && echo "  --nice=$OPT_NICE"
+  [ "$OPT_REPRODUCIBLE" = 'y' ] && echo "  --reproducible"
+  [   "$OPT_NOWARNING" != ''  ] && echo "  --nowarning=$OPT_NOWARNING"
 
   # Show the variables
   for name in $varnames; do

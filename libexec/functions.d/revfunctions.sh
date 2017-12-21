@@ -32,7 +32,7 @@ function print_current_revinfo
 #   version              (arbitrary string)
 #   built                (secs since epoch)
 #   rev                  (gitrevision, or secs since epoch if not git)
-#   os                   (<osname><osversion>)
+#   os                   (<osname><osversion> or <osname><osversion>/<kernel>)
 #   hintcksum            (md5sum, or / if no hintfile)
 {
   local itemid="$1"
@@ -57,6 +57,7 @@ function print_current_revinfo
   fi
 
   osstuff="${SYS_OSNAME}${SYS_OSVER}"
+  [ "${HINT_KERNEL[$itemid]:-n}" != 'n' ] && osstuff="${SYS_OSNAME}${SYS_OSVER}/${SYS_KERNEL}"
 
   hintstuff='/'
   if [ -n "${HINTFILE[$itemdir]}" ] && [ -s "${HINTFILE[$itemdir]}" ]; then
@@ -89,16 +90,25 @@ function calculate_deps_and_status
 # Writes a pretty tree to $DEPTREE.
 # Arguments:
 #   $1 = itemid
-#   $2 = parent's itemid, or null if no parent
+#   $2 = list of parent's itemids (direct parent first), null if no parents
 #   $3 = indentation for pretty tree
 # Return status: always 0.
 #   If anything really bad happened, TODOLIST will be empty ;-)
 {
   local itemid="$1"
-  local parentid="${2:-}"
+  local parentlist="${2:-}"
+  local parentid=$(echo "$parentlist" | sed 's/ .*//')
   local indent="${3:-}"
   local itemprgnam="${ITEMPRGNAM[$itemid]}"
   local itemdir="${ITEMDIR[$itemid]}"
+
+  local pid
+  for pid in $parentlist; do
+    if [ "$pid" = "$itemid" ]; then
+      log_warning -s "${itemid}: Circular dependency: $(echo $itemid $parentlist | awk '{for (i=NF; i>0; i--) printf "%s ",$i}')"
+      return 0
+    fi
+  done
 
   # These variables are used both here and in calculate_item_status.
   # This isn't terribly efficient, but at least db_get_rev has a cache.
@@ -120,9 +130,9 @@ function calculate_deps_and_status
     for dep in ${INFOREQUIRES[$itemid]}; do
       if [ "$dep" = '%README%' ]; then
         # %README% is now removed unconditionally, but we'll leave this check here for now:
-        log_warning "${itemid}: Unhandled %README% in ${itemprgnam}.info"
+        log_warning -s "${itemid}: Unhandled %README% in ${itemprgnam}.info"
       elif [ "$dep" = "$itemprgnam" ]; then
-        log_warning "${itemid}: Ignoring dependency of ${itemprgnam} on itself"
+        log_warning -s "${itemid}: Ignoring dependency of ${itemprgnam} on itself"
       else
         parse_arg "${dep}" "${itemid}"
         [ "${#PARSEDARGS[@]}" != 0 ] && deplist+=( "${PARSEDARGS[@]}" )
@@ -141,16 +151,12 @@ function calculate_deps_and_status
     local dep newdep olddep alreadygotnewdep
     local -a myfulldeps=()
     for dep in ${DIRECTDEPS[$itemid]}; do
-      calculate_deps_and_status "$dep" "$itemid" "$indent  "
+      calculate_deps_and_status "$dep" "$itemid $parentlist" "$indent  "
       for newdep in ${FULLDEPS[$dep]} "$dep"; do
         alreadygotnewdep='n'
         for olddep in "${myfulldeps[@]}"; do
           if [ "$newdep" = "$olddep" ]; then
             alreadygotnewdep='y'
-            break
-          elif [ "$newdep" = "$itemid" ]; then
-            alreadygotnewdep='y'
-            log_error "${itemid}: Circular dependency via $dep (ignored)"
             break
           fi
         done
@@ -340,15 +346,15 @@ function calculate_item_status
     # If the git rev has changed => update
     if [ "$pkgrev" != "$currrev" ]; then
       if [ "${GITDIRTY[$itemid]}" != 'y' ] && [ "${pkgrev/*+/+}" != '+dirty' ]; then
-        # if only README, slack-desc and .info have changed, don't build
+        # if only README*, slack-desc and .info have changed, don't build
         # (the VERSION in the .info file has already been checked ;-)
         modifilelist=( $(cd "$SR_SBREPO"; git diff --name-only "$pkgrev" "$currrev" -- "$itemdir" 2>/dev/null) )
         if [ $? = 0 ]; then
           for modifile in "${modifilelist[@]}"; do
             bn="${modifile##*/}"
-            [ "$bn" = "README" ] && continue
-            [ "$bn" = "slack-desc" ] && continue
-            [ "$bn" = "$itemprgnam.info" ] && continue
+            case "$bn" in
+              README* | slack-desc | "$itemprgnam.info" )  continue ;;
+            esac
             STATUS[$itemid]="update"
             STATUSINFO[$itemid]="update for git $shortcurrrev"
             # get title of the latest commit message
@@ -356,8 +362,12 @@ function calculate_item_status
             [ -n "$title" ] && STATUSINFO[$itemid]="${STATUSINFO[$itemid]} \"$title\""
             return 0
           done
+          # nothing important has changed, so we can bump the item's stored revision from $pkgrev to $currrev without rebuilding :)
+          if [ "$OPT_DRY_RUN" != 'y' ]; then
+            db_set_rev "$itemid" '/' "$pkgdeps" "$pkgver" "$pkgblt" "$currrev" "$pkgos" "$pkghnt"
+          fi
         else
-          # nonzero status means $pkgrev is no longer valid (e.g. upstream has rewritten history) => update
+          # nonzero status means $pkgrev is no longer valid (probably garbage collected) => need to update
           STATUS[$itemid]="update"
           STATUSINFO[$itemid]="update for git $shortcurrrev"
           return 0
@@ -394,17 +404,30 @@ function calculate_item_status
     fi
   fi
 
-  # Has the OS changed => rebuild
+  # Has the OS or kernel changed => rebuild
   curros="${SYS_OSNAME}${SYS_OSVER}"
-  if [ "$pkgos" != "$curros" ]; then
+  if [ "${pkgos%/*}" != "$curros" ]; then
     if [ "${STATUS[$itemid]}" = 'updated' ]; then
       STATUS[$itemid]="updated+rebuild"
-      STATUSINFO[$itemid]="updated + rebuild for upgraded ${SYS_OSNAME}"
+      STATUSINFO[$itemid]="updated + rebuild for ${curros}"
     else
       STATUS[$itemid]="rebuild"
-      STATUSINFO[$itemid]="rebuild for upgraded ${SYS_OSNAME}"
+      STATUSINFO[$itemid]="rebuild for ${curros}"
     fi
     return 0
+  fi
+  if [ "${HINT_KERNEL[$itemid]:-n}" != 'n' ]; then
+    pkgknl="${pkgos##*/}"
+    if [ "$pkgknl" != "$SYS_KERNEL" ]; then
+      if [ "${STATUS[$itemid]}" = 'updated' ]; then
+        STATUS[$itemid]="updated+rebuild"
+        STATUSINFO[$itemid]="updated + rebuild for kernel ${SYS_KERNEL}"
+      else
+        STATUS[$itemid]="rebuild"
+        STATUSINFO[$itemid]="rebuild for kernel ${SYS_KERNEL}"
+      fi
+      return 0
+    fi
   fi
 
   # Has the hintfile changed => rebuild
@@ -445,6 +468,23 @@ function write_pkg_metadata
   local itemdir="${ITEMDIR[$itemid]}"
   local itemfile="${ITEMFILE[$itemid]}"
   local -a pkglist
+
+  # To support BUILDTIME deps (and potentially RUNTIME) we need another list of deps :(
+  if [ -n "${HINT_BUILDTIME[$itemid]}" ] && [ -n "${FULLDEPS[$itemid]}" ]; then
+    METADEPS=""
+    for trydep in ${FULLDEPS[$itemid]}; do
+      match='n'
+      for exclude in ${HINT_BUILDTIME[$itemid]}; do
+        case ${exclude##*/} in
+          ${trydep##*/}) match='y' ;;
+          *) : ;;
+        esac
+      done
+      [ "$match" = 'n' ] && METADEPS="$METADEPS $trydep"
+    done
+  else
+    METADEPS="${FULLDEPS[$itemid]}"
+  fi
 
   #-----------------------------#
   # Update database             #
@@ -502,6 +542,7 @@ function write_pkg_metadata
     dotdep="${nosuffix}.dep"
     dottxt="${nosuffix}.txt"
     dotmeta="${nosuffix}.meta"
+    dotbuildinfo="${nosuffix}.buildinfo"
     # but the .md5, .sha256 and .asc filenames include the suffix:
     dotmd5="${pkgpath}.md5"
     dotsha256="${pkgpath}.sha256"
@@ -538,8 +579,8 @@ EOF
     #-----------------------------#
 
     if [ ! -f "$dotdep" ]; then
-      if [ -n "${FULLDEPS[$itemid]}" ]; then
-        for dep in ${FULLDEPS[$itemid]}; do
+      if [ -n "$METADEPS" ]; then
+        for dep in $METADEPS; do
           printf "%s\n" "${dep##*/}" >> "$dotdep"
         done
       fi
@@ -580,13 +621,13 @@ EOF
       if [ "$SR_FOR_SLAPTGET" -eq 1 ]; then
 
         # slack-required
-        # from packaging dir, or extract from package, or synthesise it from DIRECTDEPS
+        # from packaging dir, or extract from package, or synthesise it from METADEPS
         if [ -f "$SR_TMP"/package-"$pkgnam"/install/slack-required ]; then
           SLACKREQUIRED=$(tr -d ' ' < "$SR_TMP"/package-"$pkgnam"/install/slack-required | xargs -r -iZ echo -n "Z," | sed -e "s/,$//")
         elif grep -q install/slack-required "$dotlst"; then
           SLACKREQUIRED=$(tar xf "$pkgpath" -O install/slack-required 2>/dev/null | tr -d ' ' | xargs -r -iZ echo -n "Z," | sed -e "s/,$//")
-        elif [ -n "${DIRECTDEPS[$itemid]}" ]; then
-          SLACKREQUIRED=$(for dep in ${DIRECTDEPS[$itemid]}; do printf "%s\n" "${dep##*/}"; done | tr -d ' ' | xargs -r -iZ echo -n "Z," | sed -e "s/,$//")
+        elif [ -n "${METADEPS}" ]; then
+          SLACKREQUIRED=$(for dep in ${METADEPS}; do printf "%s\n" "${dep##*/}"; done | tr -d ' ' | xargs -r -iZ echo -n "Z," | sed -e "s/,$//")
         else
           SLACKREQUIRED=""
         fi
@@ -644,6 +685,40 @@ EOF
     # .asc                        #
     #-----------------------------#
     # gen_repos_files.sh will do it later :-)
+
+    #-----------------------------#
+    # .buildinfo                  #
+    #-----------------------------#
+
+    if [ "$OPT_REPRODUCIBLE" = 'y' ] && [ -n "$SOURCE_DATE_EPOCH" ]; then
+      # The buildinfo should not change while slackrepo is running,
+      # so we will create a temp file once and reuse it.
+      # (It's 'hidden' so it won't get cleaned up at the end of each build.)
+      buildinfotmp="$MYTMP"/.buildinfo.txt
+      if [ ! -f "$buildinfotmp" ]; then
+        osname="${SYS_OSNAME^}"
+        osver="${SYS_OSVER}"
+        [ "${SYS_CURRENT}" = 'y' ] && osver="current"
+        echo "$osname $osver $SYS_KERNEL"              > "$buildinfotmp"
+        if [ -f /var/lib/slackpkg/ChangeLog.txt ]; then
+          # We won't check that the latest changes have actually been
+          # applied.  However, it would be unusual for changes in -stable
+          # to affect builds [citation needed], and anyone attempting
+          # reproducibility on -current would be best advised to desist.
+          head -1 /var/lib/slackpkg/ChangeLog.txt     >> "$buildinfotmp"
+        else
+          echo "Thu  1 Jan 00:00:00 UTC 1970"         >> "$buildinfotmp"
+        fi
+        # record gcc target and version (e.g. might be using testing/)
+        gcc -v |& grep '^Target:' | cut -f2 -d' '     >> "$buildinfotmp"
+        gcc -v |& grep '^gcc version'                 >> "$buildinfotmp"
+      fi
+      cp "$buildinfotmp" "$dotbuildinfo"
+    fi
+
+    #-----------------------------#
+    # Done!                       #
+    #-----------------------------#
 
     # Finally, we can get rid of this:
     rm -f "$MY_PKGCONTENTS"

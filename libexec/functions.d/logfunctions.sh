@@ -2,8 +2,8 @@
 # Copyright 2014 David Spencer, Baildon, West Yorkshire, U.K.
 # All rights reserved.  For licence details, see the file 'LICENCE'.
 #
-# errorscan_itemlog contains code and concepts from 'checkpkg' v1.15
-#   Copyright 2014 Eric Hameleers, Eindhoven, The Netherlands
+# errorscan_itemlog contains code and concepts from 'checkpkg' 1.32
+#   Copyright 2014-2017 Eric Hameleers, Eindhoven, The Netherlands
 #   All rights reserved.  For licence details, see the file 'LICENCE'.
 #   http://www.slackware.com/~alien/tools/checkpkg
 #
@@ -152,27 +152,41 @@ function log_important
 #-------------------------------------------------------------------------------
 
 function log_warning
-# Log a message to standard output in yellow highlight.
+# Log a message to standard output in magenta highlight.
 # Log a message to ITEMLOG if '-a' is specified.
 # Message is prefixed with 'WARNING' (unless '-n' is specified).
 # Message is remembered in the array WARNINGLIST (unless '-n' is specified).
-# Usage: log_warning [-a] [-n] messagestring
-# Return status: always 0
+# But!!  If '-s' is specified, and the message matches a regex in
+# ${HINT_NOWARNING[$itemid]}, the message is not shown -- it isn't logged
+# to standard output, and isn't remembered in WARNINGLIST.
+# Usage: log_warning [-a] [-n] [-s] messagestring
+# Return status: 0 = ok, 1 = message was suppressed
 {
   W='WARNING: '
   A='n'
+  S='n'
   while [ $# != 0 ]; do
     case "$1" in
-    '-n') W='';  shift; continue ;;
     '-a') A='y'; shift; continue ;;
+    '-n') W='';  shift; continue ;;
+    '-s') S='y'; shift; continue ;;
     *)    break ;;
     esac
   done
-  echo -e "${NL}${colour_warning}${W}${1}${colour_normal}"
+  show='y'
+  if [ "$S" = 'y' ]; then
+    warnRE="${OPT_NOWARNING}"
+    [ -n "$itemid" ] && [ -n "${HINT_NOWARNING[$itemid]}" ] && warnRE="${HINT_NOWARNING[$itemid]}"
+    if [ -n "$warnRE" ]; then
+      if echo "$1" | grep -q -E "$warnRE"; then
+        show='n'
+      fi
+    fi
+  fi
+  [ "$show" = 'y' ] && echo -e "${NL}${colour_warning}${W}${1}${colour_normal}" && NL=''
   [ "$A" = 'y' ] && [ -n "$ITEMLOG" ] && echo -e "${W}${1}" >> "$ITEMLOG"
-  NL=''
-  [ -n "$W" ] && WARNINGLIST+=( "${1}" )
-  return 0
+  [ "$show" = 'y' ] && [ -n "$W" ] && WARNINGLIST+=( "${1}" ) && return 0
+  return 1
 }
 
 #-------------------------------------------------------------------------------
@@ -180,7 +194,7 @@ function log_warning
 function log_error
 # Log a message to standard output in red highlight, with an optional second
 # message to the right.
-# Typically the second message will be the current time, or a time estimate.
+# Typically the second message will be the current time.
 # Log a message to ITEMLOG if '-a' is specified.
 # Message is prefixed with 'ERROR: ' (unless '-n' is specified).
 # Usage: log_error [-a] [-n] messagestring
@@ -432,8 +446,9 @@ function errorscan_itemlog
 # Return status: always 0
 {
   # This is Alien Bob being awesome, as usual :D
+  # now updated w.r.t. checkpkg v. 1.32
   grep -E \
-    "FAIL| hunk ignored|[^A-Z]Error |[^A-Z]ERROR |Error:|error:|errors occurred|ved symbol|ndefined reference to|ost recent call first|ot found|cannot operate on dangling|ot supported|annot find -l|make: \*\*\* No |kipping patch|t seem to find a patch|^Usage: |option requires |o such file or dir|SlackBuild: line" \
+    "aborted!|[[:space:]]too[[:space:]]old|FAIL|[[:space:]]hunk[[:space:]]ignored|[^A-Z]Error[[:space:]]|[^A-Z]ERROR[[:space:]]|Error:|error:|errors[[:space:]]occurred|ved[[:space:]]symbol|ndefined[[:space:]]reference[[:space:]]to|ost[[:space:]]recent[[:space:]]call[[:space:]]first|ot[[:space:]]found|annot[[:space:]]find[[:space:]]-l|make:[[:space:]]\*\*\*[[:space:]]No[[:space:]]|kipping[[:space:]]patch|skipping[[:space:]]incompatible[[:space:]]|t[[:space:]]seem[[:space:]]to[[:space:]]find[[:space:]]a[[:space:]]patch|[[:space:]]not[[:space:]]supported|^Usage:[[:space:]]|option[[:space:]]requires[[:space:]]|memory[[:space:]]exhausted|cannot[[:space:]]stat[[:space:]]|SlackBuild:[[:space:]]line|No[[:space:]]such[[:space:]]file|[Uu]nrecognised[[:space:]]xattr|[Uu]nknown[[:space:]]option" \
     "$ITEMLOG"
   return 0
 }

@@ -50,7 +50,7 @@ function uninstall_deps
   local mydep
 
   if [ -n "${FULLDEPS[$itemid]}" ]; then
-    [ "$OPT_CHROOT" != 'y' ] && log_normal -a "Uninstalling dependencies ..."
+    [ "$OPT_CHROOT" = 'n' ] && log_normal -a "Uninstalling dependencies ..."
     for mydep in ${FULLDEPS[$itemid]}; do
       uninstall_packages "$mydep"
     done
@@ -137,12 +137,27 @@ function install_packages
         KEEPINSTALLED[$pkgnam]="$pkgid"
       elif [ "$istat" = 2 ]; then
         # nothing similar currently installed
+        > "$MYTMP"/installpkglog
+        teelist="$MAINLOG $MYTMP/installpkglog"
+        [ -n "$ITEMLOG" ] && teelist="$teelist $ITEMLOG"
         set -o pipefail
-        ROOT=${MY_CHRDIR:-/} ${SUDO}installpkg --terse "$pkgpath" 2>&1 | tee -a "$MAINLOG" "$ITEMLOG"
+        ROOT=${MY_CHRDIR:-/} ${SUDO}installpkg --terse "$pkgpath" 2>&1 | tee -a $teelist
         pstat=$?
         set +o pipefail
-        [ "$pstat" = 0 ] || { log_error -a "${itemid}: installpkg $pkgbase failed (status $pstat)"; return 1; }
-        dotprofilizer "$pkgpath"
+        if [ "$pstat" != 0 ]; then
+          log_error -a "${itemid}: installpkg $pkgbase failed (status $pstat)"
+          log_info -t "$(<"$MYTMP"/installpkglog)"
+          return 1
+        else
+          tersename="${pkgbase%.t?z}:"
+          logtext=$(cat "$MYTMP"/installpkglog | \
+            grep -v "^${tersename:0:72} .*] *$" | \
+            grep -v -F -e 'Reloading system message bus configuration...' \
+                       -e 'kbuildsycoca4 running...')
+          if [ -n "$logtext" ]; then
+            log_warning -a -s "${itemid}: Possible error message from doinst.sh or installpkg"
+          fi
+        fi
         [ "$OPT_INSTALL" = 'y' -o "${HINT_INSTALL[$itemid]}" = 'y' ] && KEEPINSTALLED[$pkgnam]="$pkgid"
       else
         # istat=1 (already installed, different version/arch/build/tag)
@@ -159,9 +174,9 @@ function install_packages
           pstat=$?
         fi
         [ "$pstat" = 0 ] || { log_error -a "${itemid}: upgradepkg $pkgbase failed (status $pstat)"; return 1; }
-        dotprofilizer "$pkgpath"
         KEEPINSTALLED[$pkgnam]="$pkgid"
       fi
+      dotprofilizer "$pkgpath"
     done
 
   done
@@ -195,10 +210,13 @@ function uninstall_packages
   local pkgpath
   local etcnewfiles etcdirs e
 
-  if [ "$OPT_CHROOT" = 'y' ]; then
-    # don't bother uninstalling, the chroot has already been destroyed
-    # just cherry pick 'depmod' out of the cleanup hints
-    if [ -n "${HINT_CLEANUP[$itemid]}" ]; then
+  if [ "$OPT_CHROOT" != 'n' ]; then
+    # Don't bother uninstalling, the chroot has already been destroyed,
+    # but we need to run 'depmod' if we have removed a kernel module.
+    if [ "${HINT_KERNEL[$itemid]}" = 'kernelmodule' ]; then
+      ${SUDO}depmod -a
+    elif [ -n "${HINT_CLEANUP[$itemid]}" ]; then
+      # For backwards compatibility, look for 'depmod' in the cleanup hints.
       IFS=';'
       for cleancmd in ${HINT_CLEANUP[$itemid]}; do
         if [ "${cleancmd:0:7}" = 'depmod ' ]; then
@@ -253,6 +271,10 @@ function uninstall_packages
             find /"$e" -type d -depth -exec rmdir --ignore-fail-on-non-empty {} \; 2>/dev/null
           fi
         done
+        # If it was a kernel module, we need to run depmod
+        if [ "${HINT_KERNEL[$pkgnam]}" != 'kernelmodule' ]; then
+          ${SUDO}depmod -a
+        fi
         # Do this last so it can mend things the package broke.
         # The cleanup hint can contain any required shell commands, for example:
         #   * Reinstalling Slackware packages that conflict with the item's packages
@@ -260,9 +282,9 @@ function uninstall_packages
         #   * Unsetting environment variables set in an /etc/profile.d script
         #     (e.g. unset LD_PRELOAD)
         #   * Removing specific files and directories that removepkg doesn't remove
-        #   * Running depmod to remove references to removed kernel modules
         #   * Running sed -i (e.g. to remove entries from /etc/shells, ld.so.conf)
         #   * Running ldconfig
+        #   * [obsolete] Running depmod to remove references to removed kernel modules
         # Be very careful with semicolons, IFS splitting is dumb.
         if [ -n "${HINT_CLEANUP[$itemid]}" ]; then
           IFS=';'
@@ -307,7 +329,7 @@ function is_installed
       instnam="${instid%-*-*-*}"
       if [ "$instnam" = "$pkgnam" ]; then
         if [ -n "$R_INSTALLED" ]; then
-          log_warning "Your /var/log/packages is broken."
+          log_warning -n "Your /var/log/packages is broken."
           log_warning -n "Please review these files:"
           log_warning -n "  $instpkg"
           log_warning -n "  /var/log/packages/$R_INSTALLED"
@@ -315,7 +337,7 @@ function is_installed
         fi
         R_INSTALLED="$instid"
       elif [ "${instid%-upgraded}" != "$instid" ]; then
-        log_warning "Your /var/log/packages is broken."
+        log_warning -n "Your /var/log/packages is broken."
         log_warning -n "Please review these files:"
         log_warning -n "  $instpkg"
       fi

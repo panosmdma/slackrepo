@@ -36,18 +36,15 @@ function build_item_packages
 
   buildopt=''
   [ "$OPT_DRY_RUN" = 'y' ] && buildopt=' [dry run]'
-  [ "$OPT_INSTALL" = 'y' ] && buildopt=' [install]'
-  log_itemstart "$itemid" "Starting $itemid (${STATUSINFO[$itemid]})$buildopt"
+  log_itemstart "$itemid" "Building $itemid (${STATUSINFO[$itemid]})$buildopt"
 
   TMP_SLACKBUILD="$BIGTMP/slackbuild_$itemprgnam"
   # initial wipe of $TMP_SLACKBUILD, even if $OPT_KEEP_TMP is set
   rm -rf "$TMP_SLACKBUILD"
   cp -a "$SR_SBREPO/$itemdir" "$TMP_SLACKBUILD"
 
-  if [ "$OPT_LINT" = 'y' ]; then
-    test_slackbuild "$itemid"
-    [ $? -gt 1 ] && return 7
-  fi
+  test_slackbuild "$itemid"
+  [ $? -gt 1 ] && return 7
 
   # Apply version hint
   NEWVERSION="${HINT_VERSION[$itemid]}"
@@ -84,7 +81,7 @@ function build_item_packages
   verify_src "$itemid" "log_important"
   case $? in
     0) # already got source, and it's good
-       [ "$OPT_LINT" = 'y' ] && [ -z "${HINT_NODOWNLOAD[$itemid]}" ] && test_download "$itemid"
+       [ -z "${HINT_NODOWNLOAD[$itemid]}" ] && test_download "$itemid"
        ;;
     1|2|3|4)
        # already got source but it's bad, or not got source, or wrong version => get it
@@ -110,7 +107,7 @@ function build_item_packages
   # Copy or link the source (if any) into the temporary SlackBuild directory
   # (need to copy if this is a chroot, it might be on an inaccessible mounted FS)
   if [ -n "${INFODOWNLIST[$itemid]}" ]; then
-    if [ "$OPT_CHROOT" = 'y' ]; then
+    if [ "$OPT_CHROOT" != 'n' ]; then
       cp -a "${SRCDIR[$itemid]}"/* "$TMP_SLACKBUILD/"
     else
       # "Copy / is dandy / but linky / is quicky" [after Ogden Nash]
@@ -124,7 +121,7 @@ function build_item_packages
   buildassign=$(grep -a '^BUILD=' "$TMP_SLACKBUILD"/"$itemfile")
   if [ -z "$buildassign" ]; then
     buildassign="BUILD=1"
-    log_warning -a "${itemid}: no \"BUILD=\" in $itemfile; using 1"
+    log_warning -s -a "${itemid}: no \"BUILD=\" in $itemfile; using 1"
   fi
   eval $buildassign
   if [ "${STATUSINFO[$itemid]:0:3}" = 'add' ] || [ "${STATUSINFO[$itemid]:0:18}" = 'update for version' ]; then
@@ -139,14 +136,14 @@ function build_item_packages
     else
       # If there are multiple packages from one SlackBuild, and they all have
       # different BUILD numbers, frankly we are screwed, so just use the first:
-      oldbuild=$(echo "${oldpkgs[0]}" | sed -e 's/^.*-//' -e 's/[^0-9]*$//' )
+      oldbuild=$(echo "${oldpkgs[0]}" | sed -e 's/^.*-//' -e 's/^\([[:digit:]][[:digit:]]*\).*$/\1/')
     fi
     backuppkgs=( "$SR_PKGBACKUP"/"$itemdir"/*.t?z )
     if [ "${backuppkgs[0]}" != "$SR_PKGBACKUP"/"$itemdir"/'*.t?z' ]; then
       # backup(s) exist, just look at the first (as above)
       # if the version is the same, we need the higher build no.
       backupver=$(echo "${backuppkgs[0]}" | rev | cut -f3 -d- | rev )
-      backupbuild=$(echo "${backuppkgs[0]}" | sed -e 's/^.*-//' -e 's/[^0-9]*$//' )
+      backupbuild=$(echo "${backuppkgs[0]}" | sed -e 's/^.*-//' -e 's/^\([[:digit:]][[:digit:]]*\).*$/\1/')
       [ "$backupver" = "${INFOVERSION[$itemid]}" ] && [ "$backupbuild" -gt "$oldbuild" ] && oldbuild="$backupbuild"
     fi
     nextbuild=$(( ${oldbuild:-0} + 1 ))
@@ -180,8 +177,36 @@ function build_item_packages
     PKGTYPE="$SR_PKGTYPE" \
     NUMJOBS="$SR_NUMJOBS"
 
+  # Reproducible building (* experimental *)
+  # Don't do it if this isn't a git repo or if git is dirty.
+  canreprod='n'
+  if [ "${OPT_REPRODUCIBLE:-n}" != 'n' ]; then
+    if [ "$GOTGIT" = 'y' ] && [ "${GITDIRTY[$itemid]}" != 'y' ]; then
+      canreprod='y'
+      # Use the newest revision time of the package and its first-level deps.
+      latest="$(git log -n 1 --pretty=format:%ct "${GITREV[$itemid]}")"
+      for parentid in ${DIRECTDEPS[$itemid]}; do
+        if [ "${GITDIRTY[$parentid]}" != 'y' ]; then
+          parentstamp="$(git log -n 1 --pretty=format:%ct "${GITREV[$parentid]}")"
+          [ "$parentstamp" -gt "$latest" ] && latest="$parentstamp"
+        else
+          canreprod='n'
+          break
+        fi
+      done
+    fi
+  fi
+  if [ "$canreprod" = 'y' ]; then
+    export SOURCE_DATE_EPOCH="$latest"
+    # Use our modified makepkg
+    sed -i -e "s#/sbin/makepkg #makepkg #" "$TMP_SLACKBUILD/$itemfile"
+  else
+    unset SOURCE_DATE_EPOCH
+  fi
+
   SLACKBUILDOPTS="env"
   SLACKBUILDRUN="bash ./$itemfile"
+  [ "$OPT_VERY_VERBOSE" = 'y' ] && SLACKBUILDRUN="bash -x ./$itemfile"
 
   # Process options and hints for the build:
 
@@ -213,10 +238,21 @@ function build_item_packages
         sed -i -e "s;^\./configure ;LDFLAGS=\"-L/usr/lib$libdirsuffix\" &;" "$TMP_SLACKBUILD/$itemfile"
       fi
       ;;
+    'python3' )
+      # If python3 support isn't included, add it
+      if ! grep -q python3 "$TMP_SLACKBUILD/$itemfile" ; then
+        log_info -a "Pragma: python3"
+        SEARCH="python setup.py install --root[= ]\\\$PKG"
+        ADD="if python3 -c 'import sys' 2>/dev/null; then\n  rm -rf build\n  python3 setup.py install --root=\\\$PKG\nfi"
+        sed -i -e "/$SEARCH/a$ADD" "$TMP_SLACKBUILD/$itemfile"
+      fi
+      # Add 'PYTHON3=yes' to options, for the 'other' kind of python3 SlackBuild
+      SLACKBUILDOPTS="$SLACKBUILDOPTS PYTHON3=yes"
+      ;;
     'stubs-32' )
       if [ "$SYS_ARCH" = 'x86_64' ] && [ ! -e /usr/include/gnu/stubs-32.h ]; then
         log_info -a "Pragma: stubs-32"
-        cp -a /usr/share/slackrepo/stubs-32.h /usr/include/gnu/
+        ${SUDO}cp -a /usr/share/slackrepo/stubs-32.h /usr/include/gnu/
         removestubs='y'
       fi
       ;;
@@ -289,21 +325,23 @@ function build_item_packages
       log_info -a "Pragma: need_X"
       hintneedX='y'
       ;;
+    'kernel'* | curl | wget )
+      ;;
     * )
-      log_warning -a "${itemid}: Hint PRAGMA=\"$pragma\" not recognised"
+      log_warning -s -a "${itemid}: Hint PRAGMA=\"$pragma\" not recognised"
       ;;
     esac
   done
 
   # Block X by unexporting DISPLAY
-  if [ "$OPT_LINT" = 'y' ] && [ "$hintneedX" != 'y' ]; then
+  if [ "$OPT_LINT_X" = 'y' ] && [ "$hintneedX" != 'y' ]; then
     export -n DISPLAY
   else
     export DISPLAY
   fi
   # Blocking the net will only take effect in a chroot (see chroot_setup)
   BLOCKNET='n'
-  [ "$OPT_LINT" = 'y' ] && [ "$hintneednet" != 'y' ] && BLOCKNET='y'
+  [ "$OPT_LINT_NET" = 'y' ] && [ "$hintneednet" != 'y' ] && BLOCKNET='y'
 
   # ... fakeroot ...
   if [ -n "$SUDO" ] && [ -x /usr/bin/fakeroot ]; then
@@ -320,12 +358,21 @@ function build_item_packages
   # ... and finally, VERBOSE/--color
   [ "$OPT_VERBOSE" = 'y' ] && [ "$DOCOLOUR" = 'y' ] && SLACKBUILDRUN="${LIBEXECDIR}/unbuffer $SLACKBUILDRUN"
 
-  # Finished assembling the command line.
+  # Assemble the command line
   SLACKBUILDCMD="${SLACKBUILDOPTS} ${SLACKBUILDRUN}"
+
+  # Multilib fixup
+  if [ "$SYS_MULTILIB" = "y" ]; then
+    if [ "$ARCH" = 'i486' ] || [ "$ARCH" = 'i586' ] || [ "$ARCH" = 'i686' ]; then
+      SLACKBUILDCMD=". /etc/profile.d/32dev.sh; ${SLACKBUILDCMD}"
+    fi
+  fi
 
   # Setup the chroot
   # (to be destroyed below, or by build_failed if necessary)
-  chroot_setup || return 1
+  if [ "$OPT_CHROOT" != 'n' ]; then
+    chroot_setup || return 1
+  fi
 
   # Get all dependencies installed
   install_deps "$itemid"
@@ -372,7 +419,6 @@ function build_item_packages
   # Start the resource monitor
   resource_monitor "$ITEMLOGDIR"/resource.log &
   resmonpid=$!
-  disown "$resmonpid"
 
   # Build it
   MY_STARTSTAMP="$MYTMP"/startstamp
@@ -382,43 +428,29 @@ function build_item_packages
   if [ "$OPT_VERBOSE" = 'y' ]; then
     log_verbose '\n---->8-------->8-------->8-------->8-------->8-------->8-------->8-------->8----\n' >&41
     set -o pipefail
-    if [ "$SYS_MULTILIB" = "y" ]; then
-      if [ "$ARCH" = 'i486' ] || [ "$ARCH" = 'i586' ] || [ "$ARCH" = 'i686' ]; then
-        ${CHROOTCMD}sh -c ". /etc/profile.d/32dev.sh; cd \"${TMP_SLACKBUILD}\"; ${SLACKBUILDCMD}" 2>&1 | \
-          tee >(sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/\x1b[()].//' -e 's/\x0e//g' -e 's/\x0f//g' >>"$ITEMLOG") >&41
-        buildstat=$?
-      fi
-    else
-      ${CHROOTCMD}sh -c "cd \"${TMP_SLACKBUILD}\"; ${SLACKBUILDCMD}" 2>&1 | \
-        tee >(sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/\x1b[()].//' -e 's/\x0e//g' -e 's/\x0f//g' >>"$ITEMLOG") >&41
-      buildstat=$?
-    fi
+    ${CHROOTCMD}sh -c "cd \"${TMP_SLACKBUILD}\"; ${SLACKBUILDCMD}" 2>&1 | \
+      tee >(sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/\x1b[()].//' -e 's/\x0e//g' -e 's/\x0f//g' >>"$ITEMLOG") >&41
+    buildstat=$?
     set +o pipefail
     log_verbose '\n----8<--------8<--------8<--------8<--------8<--------8<--------8<--------8<----\n' >&41
   else
-    if [ "$SYS_MULTILIB" = "y" ]; then
-      if [ "$ARCH" = 'i486' ] || [ "$ARCH" = 'i586' ] || [ "$ARCH" = 'i686' ]; then
-        ${CHROOTCMD}sh -c ". /etc/profile.d/32dev.sh; cd \"${TMP_SLACKBUILD}\"; ${SLACKBUILDCMD}" \
-          &> >(sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/\x1b[()].//' -e 's/\x0e//g' -e 's/\x0f//g' >>"$ITEMLOG")
-        buildstat=$?
-      fi
-    else
-      ${CHROOTCMD}sh -c "cd \"${TMP_SLACKBUILD}\"; ${SLACKBUILDCMD}" \
-        &> >(sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/\x1b[()].//' -e 's/\x0e//g' -e 's/\x0f//g' >>"$ITEMLOG")
-      buildstat=$?
-    fi
+    ${CHROOTCMD}sh -c "cd \"${TMP_SLACKBUILD}\"; ${SLACKBUILDCMD}" \
+      &> >(sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/\x1b[()].//' -e 's/\x0e//g' -e 's/\x0f//g' >>"$ITEMLOG")
+    buildstat=$?
   fi
 
   BUILDFINISHTIME="$(date '+%s')"
   # add 1 to round it up so it's never zero
   BUILDELAPSED=$(( BUILDFINISHTIME - BUILDSTARTTIME + 1 ))
-  kill -9 "$resmonpid"
+  kill -9 "$resmonpid" 2>/dev/null
+  wait "$resmonpid" 2>/dev/null
+  resmonpid=''
   # report the resource usage even if the build failed (it may be relevant)
   resource_report "$ITEMLOGDIR"/resource.log
 
   unset ARCH BUILD TAG TMP OUTPUT PKGTYPE NUMJOBS
   [ -n "$restorevars" ] && eval "$restorevars"
-  [ -n "$removestubs" ] && rm /usr/include/gnu/stubs-32.h
+  [ -n "$removestubs" ] && ${SUDO}rm /usr/include/gnu/stubs-32.h
 
   # If there's a config.log in the obvious place, save it
   configlog="${TMP_BUILD}/${itemprgnam}-${INFOVERSION[$itemid]}/config.log"
@@ -446,7 +478,7 @@ function build_item_packages
         if [ -f "$TMP_SLACKBUILD/README" ] && [ -f "$TMP_SLACKBUILD"/"$(basename "$itemfile" .SlackBuild)".info ]; then
           # it's probably an SBo SlackBuild, so complain and don't retag
           if [ -f "${MY_CHRDIR}$pkgpath" ]; then
-            log_warning -a "${itemid}: Package should have been in \$OUTPUT: $pkgpath"
+            log_warning -s -a "${itemid}: Package should have been in \$OUTPUT: $pkgpath"
             mv "${MY_CHRDIR}$pkgpath" "$TMP_OUTPUT"
           else
             log_error -a "${itemid}: Package not found: $pkgpath"
@@ -486,24 +518,35 @@ function build_item_packages
     #### fi ####
   done
 
-  [ "$OPT_CHROOT" = 'y' ] && chroot_report
+  [ "$OPT_CHROOT" != 'n' ] && chroot_report
 
-  if [ "$OPT_LINT" = 'y' ]; then
-    test_package "$itemid" "${pkglist[@]}"
-    [ $? -gt 1 ] && { build_failed "$itemid"; return 7; }
+  local inst testinst
+  # Do we want to install it?  if not, we'll ask for a test install.
+  inst='n'
+  testinst='-i'
+  if [ "${HINT_INSTALL[$itemid]}" = 'y' ] || [ "$OPT_INSTALL" = 'y' -a "${HINT_INSTALL[$itemid]}" != 'n' ]; then
+    inst='y'
+    testinst=''
   fi
 
-  [ "$OPT_CHROOT" = 'y' ] && chroot_destroy
+  test_package $testinst "$itemid" "${pkglist[@]}"
+  [ $? -gt 1 ] && { build_failed "$itemid"; return 7; }
+
+  [ "$OPT_CHROOT" != 'n' ] && chroot_destroy
   rm -f "$MY_STARTSTAMP" 2>/dev/null
 
-  if [ "${HINT_INSTALL[$itemid]}" = 'y' ] || [ "$OPT_INSTALL" = 'y' -a "${HINT_INSTALL[$itemid]}" != 'n' ]; then
-    install_packages "${pkglist[@]}" || { build_failed "$itemid"; return 8; }
+  if [ "$inst" = 'y' ]; then
+    build_ok "$itemid"
+    CMD='install' log_itemstart "$itemid" "Installing $itemid"
+    install_packages "$itemid" || { build_failed "$itemid"; return 8; }
+    log_important "Installing finished."
+    log_normal ""
     #### set the new pkgbase in KEEPINSTALLED[$pkgnam] ????
   else
     uninstall_deps "$itemid"
+    build_ok "$itemid"
   fi
 
-  build_ok "$itemid"  # \o/
   return 0
 }
 
@@ -573,7 +616,6 @@ function build_ok
   # ---- Logging ----
   buildopt=''
   [ "$OPT_DRY_RUN" = 'y' ] && buildopt=' [dry run]'
-  [ "$OPT_INSTALL" = 'y' ] && buildopt=' [install]'
   STATUS[$itemid]="ok"
   STATUSINFO[$itemid]="$CHANGEMSG$buildopt"
   log_itemfinish "${itemid}" 'ok' "${STATUSINFO[$itemid]}"
@@ -650,16 +692,17 @@ function build_cleanup
 #-------------------------------------------------------------------------------
 
 function chroot_setup
-# Setup a temporary chroot environment at $MYTMP/chrdir using overlayfs
+# Setup a temporary chroot environment at $MYTMP/chrootdir using overlayfs
 # Also sets the global variables $CHROOTCMD and $MY_CHRDIR
 # Return status:
 # 0 = it worked
-# 1 = OPT_CHROOT is not set, or could not mount the overlay
+# 1 = OPT_CHROOT is not set
+# Exits completely (status=6) if the overlay failed to mount
 {
   CHROOTCMD=''
-  [ "$OPT_CHROOT" != 'y' ] && return 1
+  [ "$OPT_CHROOT" = 'n' ] && return 1
 
-  MY_CHRDIR="$MYTMP"/chrdir/  # note the trailing slash
+  MY_CHRDIR="$MYTMP"/chrootdir/  # note the trailing slash
   ${SUDO}mkdir -p "$MY_CHRDIR"
   CHROOTCMD="chroot ${MY_CHRDIR} "  # note the trailing space
   [ -n "$SUDO" ] && CHROOTCMD="${SUDO} chroot --userspec=${USER} ${MY_CHRDIR} "
@@ -674,7 +717,7 @@ function chroot_setup
   OVL_DIRTY="$TMP_OVLDIR"/dirty
   OVL_WORK="$TMP_OVLDIR"/work
   ${SUDO}mkdir -p "$OVL_DIRTY" "$OVL_WORK"
-  ${SUDO}mount -t overlay overlay -olowerdir=/,upperdir="$OVL_DIRTY",workdir="$OVL_WORK" "$MY_CHRDIR" || \
+  ${SUDO}mount -t overlay overlay -olowerdir="$OPT_CHROOT",upperdir="$OVL_DIRTY",workdir="$OVL_WORK" "$MY_CHRDIR" || \
     { log_error "Failed to mount $MY_CHRDIR"; exit_cleanup 6; }
   CHRMOUNTS+=( "$MY_CHRDIR" )
 
@@ -754,8 +797,8 @@ function chroot_report
       excludes="^/dev/ttyp|^$HOME/\\.distcc|^$HOME/\\.cache|^$HOME\$|^/var/tmp|\\.pyc\$|^/etc/ld.so.cache\$|^/var/cache/ldconfig\$"
       significant="$(echo "$crap" | sed -e "s#^\./#/#" | grep -v -E "$excludes" | sort)"
       if [ -n "$significant" ]; then
-        log_warning -a "$itemid: Files/directories were modified in the chroot"
-        log_info -t -a "${significant}"
+        log_warning -s -a "$itemid: Files/directories were modified in the chroot" && \
+          log_info -t -a "${significant}"
       fi
     fi
   fi

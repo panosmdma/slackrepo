@@ -3,7 +3,6 @@
 # All rights reserved.  For licence details, see the file 'LICENCE'.
 #-------------------------------------------------------------------------------
 # parsefunctions.sh - parse functions for slackrepo
-#   init_current_pkgs
 #   parse_arg
 #   find_items
 #   parse_package_name
@@ -12,34 +11,6 @@
 
 declare -a PARSEDARGS
 declare -A ITEMDIR ITEMFILE ITEMPRGNAM PRGNAMITEMID
-
-#-------------------------------------------------------------------------------
-
-declare -A PKG_IN_CURRENT
-
-function init_current_pkgs
-# Create a list of SBo deps that are in Slackware-current
-# Return status: always 0
-{
-  for pp in \
-    "gst-plugins-libav=gst-libav" \
-    "python-six=six" \
-    "sshfs=sshfs-fuse" \
-    "libinput" "libwacom" "xf86-input-libinput" "opencl-headers" \
-    "libedit" \
-    "ffmpeg" "lame" "libbluray" \
-    "SDL2" "SDL2_gfx" "SDL2_image" "SDL2_mixer" "SDL2_net" "SDL2_ttf" \
-  ; do
-    pslack="${pp/=*/}"
-    psbo="${pp/*=/}"
-    is_installed "${pslack}-v-a-bt"
-    iistat=$?
-    if [ $iistat = 0 ] || [ $iistat = 1 ]; then
-      PKG_IN_CURRENT[$psbo]="$R_INSTALLED"
-    fi
-  done
-  return 0
-}
 
 #-------------------------------------------------------------------------------
 
@@ -69,14 +40,7 @@ function parse_arg
     shift
 
     # Shortcuts:
-    if [ "$SYS_CURRENT" = 'y' ] && [ -n "${PKG_IN_CURRENT[$arg]}" ]; then
-      if [ -n "$callerid" ]; then
-        log_info "${callerid}: using ${PKG_IN_CURRENT[$arg]} for dependency ${arg}"
-      else
-        log_start "$arg"; log_itemfinish "$arg" "skipped" "" "${arg} is already installed as ${PKG_IN_CURRENT[$arg]}"
-      fi
-      continue
-    elif [ -n "${ITEMPRGNAM[$arg]}" ]; then
+    if [ -n "${ITEMPRGNAM[$arg]}" ]; then
       # it's an already-valid itemid
       PARSEDARGS+=( "$arg" )
       continue
@@ -145,10 +109,10 @@ function parse_arg
       is_installed "${guesspkgnam}-v-a-bt"
       iistat=$?
       if [ $iistat = 0 ] || [ $iistat = 1 ]; then
-        log_warning -a "${callerid}: Found installed package ${R_INSTALLED} for ${arg} (not in repo)"
+        log_warning -s -a "${callerid}: Found installed package ${R_INSTALLED} for ${arg} (not in repo)"
         continue
       else
-        log_warning -a "${callerid}: Dependency ${arg} does not exist and has been ignored"
+        log_warning -s -a "${callerid}: Dependency ${arg} does not exist and has been ignored"
       fi
     fi
 
@@ -291,8 +255,8 @@ declare -A SRCDIR GITREV GITDIRTY
 declare -A \
   HINT_MD5IGNORE HINT_SHA256IGNORE HINT_NUMJOBS HINT_INSTALL HINT_PRAGMA \
   HINT_ARCH HINT_CLEANUP HINT_USERADD HINT_GROUPADD HINT_ANSWER HINT_NODOWNLOAD \
-  HINT_CONFLICTS \
-  HINT_OPTIONS HINT_VERSION HINTFILE
+  HINT_CONFLICTS HINT_BUILDTIME HINT_NOWARNING \
+  HINT_OPTIONS HINT_VERSION HINT_KERNEL HINTFILE
 # and for validation in test_*
 declare -A VALID_USERS VALID_GROUPS
 
@@ -334,7 +298,7 @@ function parse_info_and_hints
       GITDIRTY[$itemid]="n"
       if [ -n "$(cd "$SR_SBREPO"/"$itemdir"; git status -s .)" ]; then
         GITDIRTY[$itemid]="y"
-        log_warning "${itemid}: git is dirty"
+        log_warning -s "${itemid}: git is dirty"
       fi
     else
       GITREV[$itemid]=''
@@ -355,6 +319,7 @@ function parse_info_and_hints
     unset PRGNAM MAINTAINER EMAIL
 
     # If VERSION isn't set, snarf it from the SlackBuild:
+    local versioncmds prevdir
     if [ -z "$VERSION" ]; then
       # The next bit is necessarily dependent on the empirical characteristics
       # of the SlackBuilds in Slackware, msb, csb, etc :-/
@@ -392,11 +357,12 @@ function parse_info_and_hints
     if [ -z "${INFODOWNLIST[$itemid]}" ]; then
       # Another sneaky slackbuild snarf ;-)
       # Lots of SlackBuilds use 'wget -c' to download the source.
-      # But the url(s) might contain $PRGNAM and $VERSION, or even $SRCNAM,
+      # But the url(s) might contain $PRGNAM and $VERSION, or $SRCNAM, or $COMMITVER,
       # and might be on continuation lines.
-      local PRGNAM SRCNAM
+      local PRGNAM SRCNAM COMMITVER
       eval "$(grep 'PRGNAM=' "$SR_SBREPO"/"$itemdir"/"$itemfile")"
       eval "$(grep 'SRCNAM=' "$SR_SBREPO"/"$itemdir"/"$itemfile")"
+      eval "$(grep 'COMMITVER=' "$SR_SBREPO"/"$itemdir"/"$itemfile")"
       eval "INFODOWNLIST[$itemid]=\"$(sed ':x; /\\$/ { N; s/\\\n//; tx }' <"$SR_SBREPO"/"$itemdir"/"$itemfile" | grep 'wget  *-c  *' | sed 's/wget  *-c  *//')\""
       #### Ideally if this sneaky download failed we would run the whole SlackBuild anyway...
       HINT_MD5IGNORE[$itemid]='y'
@@ -426,6 +392,7 @@ function parse_info_and_hints
   # HINTFILE[$itemid] not set => we need to check for a hintfile
   # HINTFILE[$itemid] set to null => there is no hintfile
   # HINTFILE[$itemid] non-null => other HINT_xxx variables have already been set
+  local hintfile hintsearch trydir
 
   if [ "${HINTFILE[$itemid]+yesitisset}" != 'yesitisset' ]; then
     hintfile=''
@@ -442,18 +409,22 @@ function parse_info_and_hints
 
   if [ -n "${HINTFILE[$itemid]}" ] && [ -s "${HINTFILE[$itemid]}" ]; then
     local SKIP \
-          VERSION ADDREQUIRES OPTIONS GROUPADD USERADD CONFLICTS INSTALL NUMJOBS ANSWER CLEANUP \
-          PRAGMA SPECIAL ARCH DOWNLOAD MD5SUM SHA256SUM
+          VERSION OPTIONS GROUPADD USERADD NOWARNING NOWARNINGS \
+          ADDREQUIRES DELREQUIRES BUILDTIME CONFLICTS \
+          INSTALL NUMJOBS ANSWER CLEANUP PRAGMA SPECIAL ARCH DOWNLOAD MD5SUM SHA256SUM
     . "${HINTFILE[$itemid]}"
 
     # Process the hint file's variables individually (looping for each variable would need
     # 'eval', which would mess up the payload, so we don't do that).
     [ -n "$OPTIONS"   ] &&   HINT_OPTIONS[$itemid]="$OPTIONS"
+    [ -n "$BUILDTIME" ] && HINT_BUILDTIME[$itemid]="$BUILDTIME"
     [ -n "$CONFLICTS" ] && HINT_CONFLICTS[$itemid]="$CONFLICTS"
     [ -n "$NUMJOBS"   ] &&   HINT_NUMJOBS[$itemid]="$NUMJOBS"
     [ -n "$ANSWER"    ] &&    HINT_ANSWER[$itemid]="$ANSWER"
     [ -n "$CLEANUP"   ] &&   HINT_CLEANUP[$itemid]="$CLEANUP"
     [ -n "$PRAGMA"    ] &&    HINT_PRAGMA[$itemid]="$PRAGMA"
+   [ -n "$NOWARNINGS" ] && HINT_NOWARNING[$itemid]="$NOWARNINGS"
+    [ -n "$NOWARNING" ] && HINT_NOWARNING[$itemid]="$NOWARNING"
     [ -n "$SPECIAL"   ] &&    HINT_PRAGMA[$itemid]="$SPECIAL"
 
     # Process hint file's INSTALL
@@ -464,6 +435,7 @@ function parse_info_and_hints
     fi
 
     # Process hint file's VERSION, ARCH, DOWNLOAD[_ARCH] and [MD5|SHA256]SUM[_ARCH] together:
+    local dlvar md5var sha256var
     if [ -n "$ARCH" ]; then
       dlvar="DOWNLOAD_$ARCH"
       [ -n "${!dlvar}" ] && DOWNLOAD="${!dlvar}"
@@ -501,6 +473,7 @@ function parse_info_and_hints
     # USERADD hint format:  USERADD="<unum>:<uname>:[-g<ugroup>:][-d<udir>:][-s<ushell>:][-uargs:...] ..."
     # VALID_GROUPS and VALID_USERS are needed for test_package
     if [ -n "${GROUPADD}" ]; then
+      local groupstring gnum gname
       for groupstring in $GROUPADD; do
         gnum=''; gname="$itemprgnam"
         for gfield in $(echo "$groupstring" | tr ':' ' '); do
@@ -509,7 +482,7 @@ function parse_info_and_hints
             * ) gname="$gfield" ;;
           esac
         done
-        [ -z "$gnum" ] && { log_warning "${itemid}: GROUPADD hint has no GID number" ; break ; }
+        [ -z "$gnum" ] && { log_warning -n "${itemid}: GROUPADD hint has no GID number" ; break ; }
         if ! getent group "$gname" | grep -q "^${gname}:" 2>/dev/null ; then
           HINT_GROUPADD[$itemid]="${HINT_GROUPADD[$itemid]}groupadd -g $gnum $gname; "
         else
@@ -523,6 +496,7 @@ function parse_info_and_hints
       done
     fi
     if [ -n "$USERADD" ]; then
+      local userstring unum uname udir ufield ugroup ushell uargs
       for userstring in $USERADD; do
         unum=''; uname="$itemprgnam"; ugroup=""
         udir='/dev/null'; ushell='/bin/false'; uargs=''
@@ -537,7 +511,7 @@ function parse_info_and_hints
             *   ) uname="$ufield" ;;
           esac
         done
-        [ -z "$unum" ] && { log_warning "${itemid}: USERADD hint has no UID number" ; break ; }
+        [ -z "$unum" ] && { log_warning -n "${itemid}: USERADD hint has no UID number" ; break ; }
         if ! getent passwd "$uname" | grep -q "^${uname}:" 2>/dev/null ; then
           [ -z "$ugroup" ] && ugroup="$uname"
           HINT_USERADD[$itemid]="${HINT_USERADD[$itemid]}useradd  -u $unum -g $ugroup -c $itemprgnam -d $udir -s $ushell $uargs $uname; "
@@ -553,6 +527,7 @@ function parse_info_and_hints
     fi
 
     # Process SKIP and ADDREQUIRES in the Fixup department below.
+    local briefskip
     briefskip="${SKIP:0:20}"
     [ "${#SKIP}" -gt 20 ] && briefskip="${SKIP:0:17}..."
 
@@ -563,20 +538,24 @@ function parse_info_and_hints
       ${OPTIONS+"OPTIONS=\"$OPTIONS\""} \
       ${GROUPADD+"GROUPADD=\"$GROUPADD\""} \
       ${USERADD+"USERADD=\"$USERADD\""} \
-      ${CONFLICTS+"CONFLICTS=\"$CONFLICTS\""} \
       ${INSTALL+"INSTALL=\"$INSTALL\""} \
       ${NUMJOBS+"NUMJOBS=\"$NUMJOBS\""} \
       ${ANSWER+"ANSWER=\"$ANSWER\""} \
       ${CLEANUP+"CLEANUP=\"$CLEANUP\""} \
       ${PRAGMA+"PRAGMA=\"$PRAGMA\""} \
+      ${NOWARNING+"NOWARNING=\"$NOWARNING\""} \
       ${ARCH+"ARCH=\"$ARCH\""} \
       ${DOWNLOAD+"DOWNLOAD=\"$DOWNLOAD\""} \
       ${MD5SUM+"MD5SUM=\"$MD5SUM\""} \
       ${SHA256SUM+"SHA256SUM=\"$SHA256SUM\""} \
-      ${ADDREQUIRES+"ADDREQUIRES=\"$ADDREQUIRES\""} )"
+      ${ADDREQUIRES+"ADDREQUIRES=\"$ADDREQUIRES\""} \
+      ${DELREQUIRES+"DELREQUIRES=\"$DELREQUIRES\""} \
+      ${BUILDTIME+"BUILDTIME=\"$BUILDTIME\""} \
+      ${CONFLICTS+"CONFLICTS=\"$CONFLICTS\""} \
+      )"
 
     unset VERSION OPTIONS GROUPADD USERADD \
-          CONFLICTS \
+          BUILDTIME CONFLICTS NOWARNING \
           INSTALL NUMJOBS ANSWER CLEANUP \
           PRAGMA SPECIAL ARCH DOWNLOAD MD5SUM SHA256SUM
 
@@ -595,15 +574,66 @@ function parse_info_and_hints
       INFOREQUIRES[$itemid]=""
     fi
   else
-    # Get rid of %README% silently, and append ADDREQUIRES
-    INFOREQUIRES[$itemid]="$(echo ${INFOREQUIRES[$itemid]//%README%/} ${ADDREQUIRES})"
+
+    # (1) Remove DELREQUIRES and %README%
+    local delreq req newreqlist
+    newreqlist=""
+    for delreq in ${DELREQUIRES} '%README%'; do
+      for req in ${INFOREQUIRES[$itemid]}; do
+        [ "$req" != "$delreq" ] && newreqlist="$newreqlist $req"
+      done
+    done
+    INFOREQUIRES[$itemid]="$(echo ${newreqlist})"
+
+    # (2) python3 pragma implies a dep on python3
+    local pragma
+    for pragma in ${HINT_PRAGMA[$itemid]}; do
+      case "$pragma" in
+        'python3' ) ADDREQUIRES="python3 ${ADDREQUIRES}" ;;
+      esac
+    done
+
+    # (3) Append ADDREQUIRES and BUILDTIME
+    INFOREQUIRES[$itemid]="$(echo ${INFOREQUIRES[$itemid]} ${ADDREQUIRES} ${HINT_BUILDTIME[$itemid]})"
+
+    # (4) Substitute SUBST
+    local newrequires irqdep newdep
+    if [ "${#SUBST[@]}" != 0 ] && [ -n "${INFOREQUIRES[$itemid]}" ]; then
+      newrequires=''
+      for irqdep in ${INFOREQUIRES[$itemid]}; do
+        newdep="${SUBST[$irqdep]}"
+        if [ -z "$newdep" ]; then
+          newdep="$irqdep"
+        else
+          if [ "$newdep" = '!' ]; then
+            log_info "Substitute !${irqdep}"
+            newdep=''
+          else
+            log_info "Substitute ${irqdep} => ${newdep}"
+          fi
+        fi
+        newrequires="$newrequires $newdep"
+      done
+      INFOREQUIRES[$itemid]=$(echo $newrequires)
+    fi
+
   fi
 
+  # Set HINT_KERNEL -- there are two PRAGMAs for user interface reasons, but because
+  # they are not actioned at build-time, they are more useful in the code as HINT_KERNEL
+  HINT_KERNEL[$itemid]='n'
+  for pragma in ${HINT_PRAGMA[$itemid]}; do
+    case "$pragma" in
+      'kernel')        HINT_KERNEL[$itemid]='kernel' ;;
+      'kernelmodule' ) HINT_KERNEL[$itemid]='kernelmodule' ;;
+    esac
+  done
+
   # Fix INFOVERSION from hint file's VERSION, or DOWNLOAD, or git, or SlackBuild's modification time
-  ver="${INFOVERSION[$itemid]}"
+  local ver="${INFOVERSION[$itemid]}"
   [ -z "$ver" ] && ver="${HINT_VERSION[$itemid]}"
   [ -z "$ver" ] && ver="$(basename "$(echo "${INFODOWNLIST[$itemid]}" | sed 's/ .*//')" 2>/dev/null | rev | cut -f 3- -d . | cut -f 1 -d - | rev)"
-  [ -z "$ver" ] && log_warning "Version of $itemid can not be determined."
+  [ -z "$ver" ] && log_warning -n "Version of $itemid can not be determined."
   [ -z "$ver" ] && [ "$GOTGIT" = 'y' ] && ver="${GITREV[$itemid]:0:7}"
   [ -z "$ver" ] && ver="$(date --date=@"$(stat --format='%Y' "$SR_SBREPO"/"$itemdir"/"$itemfile")" '+%Y%m%d')"
   INFOVERSION[$itemid]="$ver"

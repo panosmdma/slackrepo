@@ -138,20 +138,40 @@ function download_src
   log_normal -a "Downloading source files ..."
   cd "$DOWNDIR"
   for url in $DOWNLIST; do
-    # wget is good for redirects and ftp, but curl's content-disposition is better,
-    # so let's try it this way:
+    # wget is good for redirects and ftp, so let's try it this way:
     dlcmd='wget'
-    case "${HINT_PRAGMA[$itemid]}" in
-      *download_basename*) dlcmd="curl" ;;
-    esac
-    # Some sites refuse to serve documents if the user-agent is wget or curl...
-    # but Dropbox fails to redirect to the actual download if the user-agent *isn't* wget.
-    # (The regex '*dropbox*' gives false positives, but is necessary to cope with
-    # dropboxusercontent.com -- hopefully no false positives refuse wget?)
-    useragent="slackrepo"
+    # some stupid sites refuse to serve documents if the user-agent is wget or curl
+    useragent="slackrepo/1.0.0"
+    # "special needs"
     case "$url" in
-      *dropbox*)  dlcmd="curl"; useragent="Wget/1.14" ;;  # this may be a lie, but who cares?
+      # dropbox fails to redirect to the actual download if the user-agent *isn't* wget
+      # (The regex '*dropbox*' gives false positives, but is necessary to cope with
+      # dropboxusercontent.com -- hopefully no false positives refuse wget?)
+      *dropbox*)
+        dlcmd="curl";
+        useragent="Wget/1.18" # this may be a lie, but who cares?
+        ;;
+      # bitbucket redirects to a URL with a commit-based query string, but does not send
+      # a content disposition header, which confuses wget, so use curl
+      *bitbucket*)
+        dlcmd="curl"
+        useragent="curl/7.51.0"
+        ;;
+      # Thanks slalik for this awesome self-explanatory fix, simple and elegant and clinical :)
+      *download.oracle.com*)
+        dlcmd="curl";
+        useragent="curl/7.51.0"
+        curlboredom="${curlboredom} --cookie oraclelicense=accept-securebackup-cookie"
+        ;;
     esac
+    # In case of utter derpage, you can override that with a pragma if necessary :(
+    for pragma in ${HINT_PRAGMA[$itemid]}; do
+      case "$pragma" in
+        curl) dlcmd="curl"; useragent="curl/7.51.0" ;;
+        wget) dlcmd="wget"; useragent="Wget/1.18" ;;
+        download_basename) dlcmd="curl" ;;  # curl -J is better than wget --content-disposition
+      esac
+    done
     wgetstat=0
     curlstat=0
     if [ "$dlcmd" = 'curl' ]; then
@@ -172,8 +192,7 @@ function download_src
         # Try SlackBuilds Direct Links
         tryurl="https://sourceforge.net/projects/slackbuildsdirectlinks/files/${ITEMPRGNAM[$itemid]}/${url##*/}"
         # use wget, seeing as it's always https from Sourceforge with its redirect mania
-        # wget failures sometimes leave an incomplete file behind, -r should ensure it is clobbered
-        wget -r $wgetboredom $wgetprogress --no-check-certificate --content-disposition -U "$useragent" "$url" 2>&41
+        wget $wgetboredom $wgetprogress --no-check-certificate --content-disposition -U "$useragent" "$tryurl" 2>&41
         trystat=$?
         if [ "$trystat" = 0 ]; then
           log_info -a "Downloaded from slackbuildsdirectlinks: ${url##*/}"
@@ -182,7 +201,7 @@ function download_src
           [ "$wgetstat" != 0 ] && failmsg="$(print_wget_status $wgetstat)"
           [ "$curlstat" != 0 ] && failmsg="$(print_curl_status $curlstat)"
           if [ "$CMD" = 'lint' ]; then
-            log_warning -a "${itemid}: Download failed: ${failmsg}."
+            log_warning -s -a "${itemid}: Download failed: ${failmsg}."
             log_info -a "$url"
           else
             log_error -a "Download failed: ${failmsg}.\n  $url"

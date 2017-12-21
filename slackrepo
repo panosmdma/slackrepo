@@ -39,16 +39,13 @@ function print_usage
   echo "  $(basename "$0") rebuild [--control_args] [item...]"
   echo "  $(basename "$0") update  [--control_args] [item...]"
   echo "  $(basename "$0") remove  [--control_args] item..."
-  echo "  $(basename "$0") revert  [--control_args] item..."
-  echo "  $(basename "$0") lint    [--control_args] [item...]"
   echo "  $(basename "$0") info    [--control_args]"
   echo 'Control args:'
   echo '  --repo=ID'
-  echo '  --verbose (-v)'
+  echo '  --preview | --dry-run | --install'
   echo '  --debug (-d)'
-  echo '  --dry-run | --install'
-  echo '  --lint'
-  echo '  --keep-tmp'
+  echo 'For the complete usage and list of control args, please see'
+  echo '  man slackrepo'
   return 0
 }
 
@@ -66,9 +63,14 @@ function exit_cleanup
 # 6 internal error
 {
   stty sane   # in case we're killed waiting for the gpg passphrase
-  [ "$1" = 1 ] && echo "Interrupted! Cleaning up ..."
+  [ "$1" = 1 ] && echo -e "\nInterrupted! Cleaning up ..." >/dev/tty
+  if [ -n "$resmonpid" ]; then
+    ${SUDO}/bin/kill -9 "$resmonpid" 2>/dev/null || true
+    wait "$resmonpid" 2>/dev/null || true
+  fi
   if [ -n "$DBUS_SESSION_BUS_PID" ]; then
-    ${SUDO}kill -15 "$DBUS_SESSION_BUS_PID" || true
+    ${SUDO}/bin/kill -15 "$DBUS_SESSION_BUS_PID" 2>/dev/null || true
+    sleep 1
   fi
   # unmount any chroot mounts, in reverse order
   for rev in $(seq $(( ${#CHRMOUNTS[@]} - 1)) -1 0); do
@@ -111,8 +113,8 @@ starttime=$(date +%s)
 # To define an extended option '--bar', do OPTIONLIST+=( 'BAR' )
 
 # Initialise OPTIONLIST first so that any extended options are at the end
-OPTIONLIST=( 'REPO' 'VERBOSE' 'VERY_VERBOSE' \
-  'DRY_RUN' 'INSTALL' 'LINT' 'KEEP_TMP' 'CHROOT' 'COLOR' 'NICE' )
+OPTIONLIST=( 'REPO' 'VERBOSE' 'VERY_VERBOSE' 'NOWARNING' \
+  'PREVIEW' 'DRY_RUN' 'INSTALL' 'LINT' 'KEEP_TMP' 'CHROOT' 'COLOR' 'NICE' 'REPRODUCIBLE' )
 
 # Get the support functions
 LIBEXECDIR="/usr/libexec/$(basename "$0")"
@@ -151,6 +153,12 @@ while [ $# != 0 ]; do
       [ -n "$CMD" ] && { print_usage; exit_cleanup 2; }
       CMD='update'
       shift; continue ;;
+    install )
+      [ -n "$CMD" ] && { print_usage; exit_cleanup 2; }
+      # transform the 'install' command into 'build --install'
+      CMD='build'
+      OPT_INSTALL='y'
+      shift; continue ;;
     remove | --remove )
       [ -n "$CMD" ] && { print_usage; exit_cleanup 2; }
       CMD='remove'
@@ -178,6 +186,10 @@ while [ $# != 0 ]; do
     --color=* | --colour=* )
       OPT_COLOR="${1/--colo*r=/}"
       shift; continue ;;
+    --nowarning=* | --nowarnings=* )
+      OPT_NOWARNING="${1/--nowarning*=/}"
+      [ "${OPT_NOWARNING}" = '' ] && OPT_NOWARNING='.*'
+      shift; continue ;;
     -* )
       found='n'
       for opt in "${OPTIONLIST[@]}"; do
@@ -185,7 +197,7 @@ while [ $# != 0 ]; do
         if [ "$1" = "--${arg}" ] || [ "$1" = "--${arg}=yes" ] || [ "$1" = "--${arg}=y" ]; then
           eval OPT_"${opt}"='y'
           found='y'; break
-        elif [ "$1" = "--no-${arg}" ] || [ "$1" = "--${arg}=no" ] || [ "$1" = "--${arg}=n" ]; then
+        elif [ "$1" = "--no-${arg}" ] || [ "$1" = "--${arg}=no" ] || [ "$1" = "--${arg}=n" ] || [ "$1" = "--${arg}=none" ]; then
           eval OPT_"${opt}"='n'
           found='y'; break
         elif [ "${1/=*/=}" = "--${arg}=" ]; then
@@ -231,22 +243,25 @@ if [ "$EUID" != 0 ]; then
     echo "$(basename "$0"): Running as non-root user, but fakeroot is not installed."
     echo "$(basename "$0"): You should either install fakeroot or run slackrepo as root."
     exit_cleanup 4
+  elif ! sudo -v >/dev/null 2>&1; then
+    echo "$(basename "$0"): Running as non-root user, but sudo is not configured."
+    echo "$(basename "$0"): You need to edit /etc/sudoers.d/slackrepo."
+    exit_cleanup 4
   fi
   SUDO="/usr/bin/sudo "
   export PATH="${LIBEXECDIR}:/usr/local/sbin:/usr/sbin:/sbin:$PATH"
-  # We need to launch a dbus session instance for root outside the chroot, to prevent
-  # commands like gconftool-2 (in doinst.sh) launching a dbus in the chroot that
-  # would persist after chroot exits and stop us unmounting the overlay (*BIG SIGH*)
-  dbuscrap="$(DISPLAY='' ${SUDO}dbus-launch --sh-syntax 2>/dev/null)"
-  eval "${dbuscrap}"
 else
   SUDO=''
   export PATH="${LIBEXECDIR}:$PATH"
-  # If there is no existing dbus session instance for root, create one
-  if [ -z "$DBUS_SESSION_BUS_ADDRESS" ]; then
-    dbuscrap="$(DISPLAY='' dbus-launch --sh-syntax 2>/dev/null)"
-    eval "${dbuscrap}"
-  fi
+fi
+
+# If there is no existing dbus session instance for root, create one.  We need
+# to have a dbus session instance for root outside the chroot, to prevent
+# commands like gconftool-2 (in doinst.sh) launching a dbus in the chroot that
+# would persist after chroot exits and stop us unmounting the overlay (*BIG SIGH*)
+if [ -z "$DBUS_SESSION_BUS_ADDRESS" ]; then
+  dbuscrap="$(DISPLAY='' ${SUDO}dbus-launch --sh-syntax 2>/dev/null)"
+  eval "${dbuscrap}"
 fi
 
 # Ensure ctrl-c (etc) exits the whole thing, not just a random subshell
@@ -279,8 +294,15 @@ SYS_NPROC=$(nproc)
 [ -z "$SYS_MHz" ] && [ -f /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_cur_freq ] && \
   SYS_MHz=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_cur_freq | sed 's/...$//')
 SYS_OVERLAYFS='n'
-# don't look at the kernel version -- somebody might have the old patchset
-[ -f /lib/modules/"$(uname -r)"/kernel/fs/overlayfs/overlay.ko ] && SYS_OVERLAYFS='y'
+# don't look at the kernel version -- somebody might have the old patchset,
+# or we might be in something like an OpenVZ instance
+if \
+  [ -d /sys/module/overlay ] || \
+  [ -f /lib/modules/"$(uname -r)"/kernel/fs/overlayfs/overlay.ko ] || \
+  grep -q overlay /proc/filesystems
+then
+  SYS_OVERLAYFS='y'
+fi
 # Detect current
 SYS_CURRENT='n'
 if [ -f /var/lib/slackpkg/ChangeLog.txt ] && ! grep -q "${SYS_OSVER}.*is released" /var/lib/slackpkg/ChangeLog.txt; then
@@ -291,7 +313,6 @@ elif [ "${SYS_OSNAME}${SYS_OSVER}" = "slackware14.2" ]; then
   for filefile in /var/log/packages/file-5.25-*-1; do
     if [ ! -f "$filefile" ]; then
       SYS_CURRENT='y'
-      init_current_pkgs
       break
     fi
   done
@@ -346,6 +367,10 @@ for conf in "$userconf" "$genrepconf"; do
   fi
 done
 
+# Save the LINT config variable, we need it as a default for '--lint=y' or '--lint'
+# (see below!)
+LINT_DEFAULTS="$LINT"
+
 # Backfill the SR_ variables from config file variables,
 # and unset the config file variables to prevent SlackBuilds from seeing them:
 for name in $varnames $genrepnames $initnames; do
@@ -361,7 +386,7 @@ for name in "${OPTIONLIST[@]}" ; do
   # simplify anything that looks like a Boolean:
   if   [ "${!optvar}" = '1' ] || [ "${!optvar}" = 'yes' ] || [ "${!optvar}" = 'y' ] || [ "${!optvar}" = 'YES' ] || [ "${!optvar}" = 'Y' ]; then
     eval "$optvar"='y'
-  elif [ "${!optvar}" = '0' ] || [ "${!optvar}" = 'no'  ] || [ "${!optvar}" = 'n' ] || [ "${!optvar}" = 'NO'  ] || [ "${!optvar}" = 'N' ] || [ "${!optvar}" = '' ]; then
+  elif [ "${!optvar}" = '0' ] || [ "${!optvar}" = 'no'  ] || [ "${!optvar}" = 'n' ] || [ "${!optvar}" = 'NO'  ] || [ "${!optvar}" = 'N' ] || [ "${!optvar}" = 'none' ] || [ "${!optvar}" = '' ]; then
     eval "$optvar"='n'
   fi
 done
@@ -369,16 +394,63 @@ done
 # Resolve conflicting options:
 # --very-verbose implies --verbose
 [ "$OPT_VERY_VERBOSE" = 'y' ] && OPT_VERBOSE='y'
-# --dry-run overrides --install
+# --preview or --dry-run overrides --install
+[ "$OPT_PREVIEW" = 'y' ] && OPT_INSTALL='n'
 [ "$OPT_DRY_RUN" = 'y' ] && OPT_INSTALL='n'
 # lazy implementation of --very-verbose ;-)
 [ "$OPT_VERY_VERBOSE" = 'y' ] && export VERBOSE=1 V=1
+# compatibility fix, OPT_CHROOT is now a pathname or 'n'
+[ "$OPT_CHROOT" = 'y' ] && OPT_CHROOT='/'
 # chroot will only work if overlayfs is available
-if [ "$OPT_CHROOT" = 'y' ] && [ "$SYS_OVERLAYFS" != 'y' ]; then
-  OPT_CHROOT='n'
-fi
+[ "$SYS_OVERLAYFS" != 'y' ] && OPT_CHROOT='n'
 # accept null niceness, map to zero
 [ -z "$OPT_NICE" ] && OPT_NICE='0'
+# fixup NOWARNING (if you really want the regex to match 'n', see a doctor)
+[ "$OPT_NOWARNING" = 'n' ] && OPT_NOWARNING=''
+
+# Set up the OPT_LINT_* suboptions. This is horrible, sorry.
+LINT_ALL="sb,dl,x,net,pkg,inst"
+[ "${LINT_DEFAULTS}" = 'y' ] && LINT_DEFAULTS="${LINT_ALL}"
+# start by turning them all off
+for vopt in $(echo "${LINT_ALL}" | sed 's/,/ /g'); do
+  eval OPT_LINT_"${vopt^^}"='n'
+done
+# handle yes/no/etc
+case "${OPT_LINT}" in
+  y|yes|1)      OPT_LINT="${LINT_DEFAULTS}" ;;
+  a|all)        OPT_LINT="${LINT_ALL}" ;;
+  n|none|''|0)  OPT_LINT="n" ;;
+  *)            : ;;
+esac
+# turn them on individually
+if [ "$OPT_LINT" != 'n' ]; then
+  foundopts=''
+  for uopt in $(echo "$OPT_LINT" | sed 's/,/ /g'); do
+    found='n'
+    for vopt in $(echo "${LINT_ALL}" | sed 's/,/ /g'); do
+      if [ "$uopt" = "$vopt" ]; then
+        found='y'
+        foundopts="${foundopts}${vopt},"
+        eval OPT_LINT_"${vopt^^}"='y'
+        break
+      fi
+    done
+    [ "$found" = 'n' ] && echo "$(basename "$0"): lint option not valid: $uopt" >&2
+  done
+  OPT_LINT="${foundopts%%,}"
+fi
+
+# Set up the dependency substitutions in SUBST
+declare -A SUBST
+if [ -n "$SR_SUBSTITUTE" ]; then
+  for sub in $(echo $(echo $SR_SUBSTITUTE | sed -e 's/,/ /g') | sed -e 's/ *=> */=>/g') ; do
+    depdel="${sub/=>*/}"
+    depadd="${sub/*=>/}"
+    [ "${depdel:0:1}" = '!' ] && depadd='!'
+    [ -z "$depadd" ] && depadd='!'
+    SUBST[${depdel##!}]="$depadd"
+  done
+fi
 
 # If SR_NUMJOBS or SR_ARCH not set, work them out and set them explicitly
 if [ -z "$SR_NUMJOBS" ]; then
@@ -403,8 +475,14 @@ for name in $varnames $genrepnames $initnames; do
   srvar="SR_$name"
   eval "$srvar=\"$(echo "${!srvar}" | sed -e "s/%REPO%/$OPT_REPO/g" -e "s/%SLACKVER%/$SYS_OSVER/g" -e "s/%ARCH%/$SR_ARCH/g")\""
 done
+for name in OPT_CHROOT; do
+  eval "$name=\"$(echo "${!name}" | sed -e "s/%REPO%/$OPT_REPO/g" -e "s/%SLACKVER%/$SYS_OSVER/g" -e "s/%ARCH%/$SR_ARCH/g")\""
+done
 
-# Do this before initialising the repo:
+#-------------------------------------------------------------------------------
+
+# Run the 'info' command right now.
+# It's completely passive, we don't want to initialise the repo.
 [ "${CMD}" = 'info' ] && { info_command; exit_cleanup 0; }
 
 #-------------------------------------------------------------------------------
@@ -413,15 +491,25 @@ done
 
 # Setup locking and logging:
 LOCKFILE="$(dirname "$SR_SBREPO")/.lock"
-mkdir -p "$(dirname "$LOCKFILE")" || \
-  { echo "$(basename "$0"): Failed to create repository root directory: $(dirname "$LOCKFILE")" >&2; exit_cleanup 4; }
-touch "$LOCKFILE"
-mkdir -p "$SR_LOGDIR" || \
-  { echo "$(basename "$0"): Failed to create log directory: $SR_LOGDIR" >&2; exit_cleanup 4; }
+if ! mkdir -p "$(dirname "$LOCKFILE")"; then
+  echo "$(basename "$0"): Failed to create repository root directory: $(dirname "$LOCKFILE")" >&2
+  [ "$EUID" != 0 ] && echo "You're not root, you need to set SBREPO to a writable directory." >&2
+  exit_cleanup 4
+fi
+if ! touch "$LOCKFILE"; then
+  echo "$(basename "$0"): Failed to create lock file: $LOCKFILE" >&2
+  [ "$EUID" != 0 ] && echo "You're not root, you need to set SBREPO to a writable directory." >&2
+  exit_cleanup 4
+fi
+if ! mkdir -p "$SR_LOGDIR"; then
+  echo "$(basename "$0"): Failed to create log directory: $SR_LOGDIR" >&2
+  [ "$EUID" != 0 ] && echo "You're not root, you need to set LOGDIR to a writable directory." >&2
+  exit_cleanup 4
+fi
 MAINLOG="$SR_LOGDIR"/$(basename "$0")_$(date '+%F_%T').log
 init_colour
 if [ "$DOCOLOUR" = 'y' ]; then
-  exec 40>"$LOCKFILE" 41>&1 &> >( tee >(sed -e 's/\x1b\[[0-9?;]*[a-zA-Z\]]//g' -e 's/\x9b[0-9?;]*[a-zA-Z\]]//g' -e 's/\x1b[()].//' -e 's/\x0e//g' -e 's/\x0f//g' >"$MAINLOG") )
+  exec 40>"$LOCKFILE" 41>&1 &> >( tee >(sed -u -e 's/\x1b\[[0-9?;]*[]a-zA-Z]//g' -e 's/\x9b[0-9?;]*[]a-zA-Z]//g' -e 's/\x1b[()].//' -e 's/\x0e//g' -e 's/\x0f//g' >"$MAINLOG") )
 else
   exec 40>"$LOCKFILE" 41>&1 &> >( tee "$MAINLOG" )
 fi
@@ -433,6 +521,17 @@ fi
 
 # Arrays for tracking outcomes:
 declare -a OKLIST WARNINGLIST SKIPPEDLIST FAILEDLIST ABORTEDLIST
+
+# Validate $OPT_CHROOT:
+if [ "$OPT_CHROOT" != 'n' ]; then
+  if [ ! -d "$OPT_CHROOT" ]; then
+    log_error "chroot is not a directory: $OPT_CHROOT"; exit_cleanup 4
+  elif [ ! -x "$OPT_CHROOT"/bin/bash ]; then
+    log_error "Not a usable chroot: $OPT_CHROOT"; exit_cleanup 4
+  else
+    OPT_CHROOT=$(realpath "$OPT_CHROOT")
+  fi
+fi
 
 # Create directories:
 [ -d "$SR_SBREPO" ]   || \
@@ -461,11 +560,11 @@ SR_TMP=${SR_TMP:-/tmp/SBo}
 # really really don't want the next bit to go badly ;-)
 if [ -n "$SR_TMP" ] && [ -d "$SR_TMP" ]; then
   log_normal "Cleaning $SR_TMP ... "
-  # remove it completely to avoid ownership and permission problems
-  ${SUDO}rm -rf "${SR_TMP:?NotSetSR_TMP}"
+  find "${SR_TMP:?NotSetSR_TMP}" -mindepth 1 -maxdepth 1 -exec ${SUDO}rm -rf {} \;
   log_done
 fi
 mkdir -p "$SR_TMP" || { log_error "Failed to create $SR_TMP"; exit_cleanup 4; }
+[ -n "$SUDO" ] && ${SUDO}chown "$USER" "$SR_TMP"
 
 # We need a slackrepo-specific temporary directory, for small stuff only
 MYTMP=$(mktemp -t -d slackrepo.XXXXXX) || { log_error "Failed to create temporary directory"; exit_cleanup 4; }
@@ -490,6 +589,8 @@ fi
 # We will use $SR_SBREPO as the working directory; it simplifies lots of git stuff.
 cd "$SR_SBREPO" || { log_error "Failed to access SlackBuilds repository"; exit_cleanup 4; }
 
+#-------------------------------------------------------------------------------
+
 # We used to check whether this is a git repo with...
 # if [ "$(git rev-parse --is-inside-work-tree 2>/dev/null)" = "true" ]; then
 # ... but it's painfully slow, so instead we'll just do this:
@@ -500,7 +601,8 @@ GOTGIT=n
 if [ -z "$(ls "$SR_SBREPO" 2>/dev/null)" ]; then
   if [ -n "${SR_INIT_GITCLONE}" ]; then
     log_normal "Cloning SlackBuilds repository $SR_SBREPO from ${SR_INIT_GITCLONE}."
-    git clone "${SR_INIT_GITCLONE}" "$SR_SBREPO"
+    git clone "${SR_INIT_GITCLONE}" "$SR_SBREPO" || \
+      { log_error "Failed to clone from ${SR_INIT_GITCLONE}"; exit_cleanup 4; }
     git fetch -a
     git remote update
     mybranch="${SR_INIT_GITBRANCH:-${SYS_OSVER:-master}}"
@@ -511,45 +613,12 @@ if [ -z "$(ls "$SR_SBREPO" 2>/dev/null)" ]; then
     log_normal "Finished cloning SlackBuilds repository."
     GOTGIT='y'
   fi
-elif [ "$GOTGIT" = 'y' ] && [ "$CMD" = 'build' ] || [ "$CMD" = 'rebuild' ] || [ "$CMD" = 'update' ]; then
-  # Update git if git is clean, and the current branch is $SR_INIT_GITBRANCH
-  log_normal "Checking whether git is clean ... "
-  muck="$(git status -s .)"
-  if [ -z "$muck" ]; then
-    log_done "yes."
-  else
-    log_done "no."
-  fi
-  currbranch=$(git rev-parse --abbrev-ref HEAD)
-  if [ -z "$muck" ] && [ "$currbranch" = "${SR_INIT_GITBRANCH:-master}" ]; then
-    prevfetch=$(db_get_misc "git_fetch_${currbranch}")
-    if [ $(( $(date +%s) - ${prevfetch:-0} )) -gt 86400 ]; then
-      log_normal "Updating git ..."
-      if [ "${OPT_REPO}" = 'ponce' ] && [ "$currbranch" = 'current' ]; then
-        git fetch --all --prune
-        db_set_misc "git_fetch_${currbranch}" "$(date +%s)"
-        git checkout --quiet origin/"$currbranch"
-        git branch --quiet -D "$currbranch"
-        git checkout -b "$currbranch"
-        gitstat=$?
-      else
-        git fetch
-        db_set_misc "git_fetch_${currbranch}" "$(date +%s)"
-        dounbuffer=""
-        [ "$DOCOLOUR"  = 'y' ] && dounbuffer="${LIBEXECDIR}/unbuffer "
-        $dounbuffer git merge --ff-only origin/"$currbranch"
-        gitstat=$?
-      fi
-      if [ $gitstat = 0 ]; then
-        log_normal "Finished updating git."
-      else
-        log_error "Failed to update git (status=$gitstat).\nPlease resolve any conflicts and merge manually."
-        exit_cleanup 4
-      fi
-    fi
-  fi
 fi
 
+# Run the start hooks here, probably including gitfetch_hook
+run_hooks start
+
+# Index the slackbuilds, for speed
 sbindexed="$(db_get_misc "indexed_slackbuilds")"
 [ "$GOTGIT" = 'y' ] && gitdate="$(git log -n 1 --format=%ct)"
 if [ "$GOTGIT" = 'n' ] || [ -n "$muck" ] || [ "${sbindexed:-0}" != "$gitdate" ]; then
@@ -563,7 +632,7 @@ if [ "$GOTGIT" = 'n' ] || [ -n "$muck" ] || [ "${sbindexed:-0}" != "$gitdate" ];
   log_done
 fi
 
-# Show some info about the repo:
+# Show some info about the repo
 if [ "$GOTGIT" = 'y' ]; then
   [ -n "$(git status -s .)" ] && dirty=' (DIRTY)'
   log_info "git repo: $SR_SBREPO"
@@ -574,8 +643,6 @@ if [ "$GOTGIT" = 'y' ]; then
 else
   log_info "SlackBuild repo: $SR_SBREPO (not git)"
 fi
-
-#-------------------------------------------------------------------------------
 
 # Changelog:
 CHANGELOG="$SR_PKGREPO"/.changelog
@@ -592,7 +659,7 @@ if [ -n "$SR_TAG" ] && [ "$OPT_INSTALL" != 'y' ] && [ "$CMD" != 'remove' ]; then
   for pkg in /var/log/packages/*"$SR_TAG"; do
     if [ -f "$pkg" ]; then
       pkgid="${pkg##*/}"
-      [ "${#KEEPINSTALLED[@]}" = 0 ] && log_warning "Packages with tag $SR_TAG are already installed"
+      [ "${#KEEPINSTALLED[@]}" = 0 ] && log_warning -s "Packages with tag $SR_TAG are already installed"
       log_normal "  $pkgid"
       KEEPINSTALLED[${pkgid%-*-*-*}]="$pkgid"
     fi
@@ -642,7 +709,43 @@ secs=$(( $(date +%s) - starttime ))
 h=$(( secs / 3600 )); m=$(( ( secs / 60) % 60 )); s=$(( secs % 60 ))
 log_normal "Runtime:     ${h}h ${m}m ${s}s"
 
-if [ "$OPT_DRY_RUN" = 'y' ]; then
+if [ "$OPT_PREVIEW" = 'y' ]; then
+  knownitems=( ${!STATUSINFO[@]} )
+  PENDINGLIST=()
+  totalbuildsecs=60  # always estimate at least 1 min ;-)
+  unknownbuildsecs=0
+  for i in ${knownitems[@]}; do
+    case "${STATUS[$i]}" in
+      ok|updated|skipped|unsupported|aborted)
+        : ;;
+      *)
+        PENDINGLIST+=( "$(printf '%s (%s)\n' "$i" "${STATUSINFO[$i]}")" )
+        estbuildsecs=''
+        read -r prevsecs prevmhz guessflag < <(db_get_buildsecs "$i")
+        if [ -n "$prevsecs" ] && [ -n "$prevmhz" ] && [ -n "$SYS_MHz" ]; then
+          estbuildsecs=$(echo "scale=3; ${prevsecs}*${prevmhz}/${SYS_MHz}+1" | bc | sed 's/\..*//')
+        fi
+        if [ -z "$estbuildsecs" ]; then
+          unknownbuildsecs=$(( unknownbuildsecs + 1 ))
+        else
+          totalbuildsecs=$(( totalbuildsecs + estbuildsecs ))
+        fi
+        ;;
+    esac
+  done
+  pendingcount="${#PENDINGLIST[@]}"
+  if [ "$pendingcount" != 0 ]; then
+    log_normal "Pending:     $pendingcount"
+    log_info "$(printf '  %s\n' "${PENDINGLIST[@]}" | sort)"
+    ((hr=${totalbuildsecs}/3600))
+    ((mn=(${totalbuildsecs}%3600)/60))
+    if [ "$unknownbuildsecs" = 0 ]; then
+      log_normal "Estimated build time ${hr}h ${mn}m"
+    else
+      log_normal "Estimated build time ${hr}h ${mn}m (+ $unknownbuildsecs unknown)"
+    fi
+  fi
+elif [ "$OPT_DRY_RUN" = 'y' ]; then
   OKLIST=( $(printf '%s\n' "${OKLIST[@]}" | sort -u) )
   okcount="${#OKLIST[@]}"
   if [ "$okcount" != 0 ]; then
@@ -711,37 +814,19 @@ if [ "$warningcount" != 0 ]; then
 fi
 
 #-------------------------------------------------------------------------------
-# Package repository maintenance: gen_repos_files.sh
-#-------------------------------------------------------------------------------
+# Run the finish hooks, probably including gen_repos_files.sh
 
-genrepstat=0
-if [ "$OPT_DRY_RUN" != 'y' ] && [ -s "$CHANGELOG" ]; then
-  if [ "$SR_USE_GENREPOS" = 1 ]; then
-    if [ -z "$SR_RSS_UUID" ]; then
-      log_error "Please set RSS_UUID in $repoconf"
-      genrepstat=9
-    else
-      log_start "gen_repos_files.sh"
-      # 'man sort' says an in-place sort is ok, so let's be lazy :-)
-      sort -o "$CHANGELOG" "$CHANGELOG"
-      REPOSROOT="$SR_REPOSROOT" REPOSOWNER="$SR_REPOSOWNER" REPOSOWNERGPG="$SR_REPOSOWNERGPG" DL_URL="$SR_DL_URL" \
-      RSS_TITLE="$SR_RSS_TITLE" RSS_ICON="$SR_RSS_ICON" RSS_LINK="$SR_RSS_LINK" RSS_CLURL="$SR_RSS_CLURL" \
-      RSS_DESCRIPTION="$SR_RSS_DESCRIPTION" RSS_FEEDMAX="$SR_RSS_FEEDMAX" RSS_UUID="$SR_RSS_UUID" \
-      GPGBIN="$SR_GPGBIN" USE_GPGAGENT="$SR_USE_GPGAGENT" FOR_SLAPTGET="$SR_FOR_SLAPTGET" \
-      FOLLOW_SYMLINKS="$SR_FOLLOW_SYMLINKS" REPO_SUBDIRS="$SR_REPO_SUBDIRS" \
-      sh "${LIBEXECDIR}"/gen_repos_files.sh -l "$CHANGELOG"
-      genrepstat=$?
-      [ "$genrepstat" != 0 ] && log_error "gen_repos_files.sh failed -- changelog retained"
-      log_normal ""
-      log_important "Finished gen_repos_files.sh at $(date +%T)"
-    fi
-  fi
-fi
+# Hooks can prevent removal of the changelog by setting $changelogstat nonzero.
+# (The changelog is for gen_repos_files.sh, and if gen_repos_files.sh fails e.g.
+# because of signing problems, we want to keep the changelog. But if the genrepos
+# hook isn't being run, we want to remove the changelog.)
+changelogstat=0
+
+run_hooks finish
+
+[ "$changelogstat" = 0 ] && rm -f "$CHANGELOG"
 
 #-------------------------------------------------------------------------------
 
 log_normal ""
-
-[ "$genrepstat" = 0 ] && rm -f "$CHANGELOG"
-
 exit_cleanup 0
